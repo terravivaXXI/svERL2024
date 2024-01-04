@@ -1,9 +1,9 @@
 All scripts are rooted at the top of the following branching directory:
-sfm
-- paper1
--- datP1
--- scrP1
--- ploP1
+- sfm
+-- paper1
+--- datP1
+--- scrP1
+--- ploP1
 
 If attempting to reproduce the workflow, please:
 - download and host the data at sfm/paper1/datP1
