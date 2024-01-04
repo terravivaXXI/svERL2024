@@ -1,1 +1,63 @@
+Data for this article comes from different sources:
 
+All data in the directory _pop_ was downloaded from the webpage of the **Sistema Nacional de Informacion Municipal** 
+that can be accessed through [INAFED](http://www.snim.rami.gob.mx/snim1.html) portal under the
+tab _Descarga de Base de Datos_. This website has a large collection of datasets in the topics of 
+Population, Housing, Economy, Marginalization, Indigenous Languages and others.
+
+Data in CONABIO directory was directly downloaded from [CONABIO website](http://www.conabio.gob.mx/informacion/gis/?vns=gis_root/region/biotic/spr_gw) using the 
+_Portal de Geoinformacion 2022_ where you can select the dataset that will be overlaid
+on the actual map of Mexico. To download the data, go to the ribbon immediately above the map
+and click "Descargar Tema", which will automatically download the .zip file to your machine.
+
+Metadata for elections is included as a separate file within the directory _elections_ as
+there are many considerations that have to be kept in mind to process the information.
+
+All files within the *Mun_agg_INEGI_census* in the directory *inegi_microdatos_lab* were transfered 
+to me via FTP by the office of Microdatos, as they have the most user friendly formats for the 
+census aggregates that cannot be uploaded to the website as they are too big. 
+
+Files in *inegi_website* were downloaded directly from the [INEGI website]():
+- [Catalogo de Localidades](https://www.inegi.org.mx/app/ageeml/)
+- [Indicadores Municipales](https://www.inegi.org.mx/app/scitel/Default?ev=9). As the
+ITER system only allows user to download data state by state, I wrote directly to the
+system manager and they provided me with the municipality aggregates via e-mail
+- [Panorama Sociodemografico de Mexico](https://www.inegi.org.mx/programas/ccpv/2020/tableros/panorama/) is
+a new product that condenses the most relevant indicators from ITER in one spreadsheet 
+curated for a simpler read. Given that I have the Indicadores Municipales, there is no 
+actual need of this DB but I thought it would be of help to have it with its clean format.
+- [ENAS](https://www.inegi.org.mx/datosabiertos/) were dowloaded in bulk and do not
+have a helpful structure for analysis
+- *LM-2071...* contains all field descriptors for INEGI census, and is helpful for 
+designing algorithms but does not contain actual data.
+
+Files in *procampo* were downloaded using a python script from the webpage [Subsidios al Campo](http://subsidiosalcampo.org.mx/)
+the script can be found in AgCensusMx project.
+
+Sembrando Vida info has been downloaded from the webpage of the [Padron Unico de Beneficiarios](https://pub.bienestar.gob.mx/pub/programasIntegrales) by clicking the 
+program name, selecting the desired period and then selecting any state + obtener to 
+unlock a box in the upper right hand that will offer a download of the enrollment 
+list and payments for that month. The links to the download are stored in the file 
+_urls_for_download_ in _data/processed_ and the script *sv/PadronSV_downloader* will 
+fetch the data and store it in _data/temp_
+
+Spatial data was downloaded directly from INEGI website, there are specific locations for
+each topic [Continuo Nacional de Vegetacion](https://www.inegi.org.mx/temas/usosuelo/#Descargas) and
+[Marco Geoestadistico](https://www.inegi.org.mx/temas/mg/#Descargas)
+
+All "SV_" files were derived from the SV enrollment lists downloaded from 
+the government webpage.
+
+Forest cover data was processed with Earth Engine and downloaded as csvs on 
+a municipality resolution. 
+
+Biodiversity indexes were derived from CONABIO's priority maps available 
+on the website. A post processing was done to allocate each municipality 
+a value ranging from 0 to 3 depending on the proportion of its land 
+characterized as prioritary. 
+
+Indice de Rezago Social data is produced by CONAPO and is accessible through government 
+open data portal.
+
+MGN december 2021 is from INEGI downloaded directly from the website and from
+which only the municipality shapefiles were retained
