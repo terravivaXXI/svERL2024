@@ -1,0 +1,1102 @@
+---
+title: "6_lm_sv_municipality"
+author: "Pablo"
+date: "2022-10-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# knitr::opts_knit$set(root.dir = './../..')
+library(tidyverse)
+library(GGally)
+library(sf)
+```
+
+## Selecting the variables for LM
+
+```{r include=FALSE}
+z <- read_csv("paper1/datP1/finalDB.csv")
+```
+
+
+Pull out the candidates for building a lm 
+
+```{r}
+lm_candidates <- z %>% select(
+  CVEGEO, # Just to have an identifier at hand
+  sv_pfam_rec_0, # The two predicted variables
+  sv_final_num_beneficiarios_0,
+  area21, # Might be used
+  i20_rural_households, # Here important to note that metropolitan municipalities have 0 households
+  irs_20_index, # continuous
+  irs20_degree, # categorical
+  i20_ind_lang_perc, # This one likely collinear with IRS indexes
+  gfw_area_forest_perc, # Percentage of the municipality covered by forest
+  gfw_pondTreeCover, # Absolute area of forest in municipality
+  gfw_avg_norm_loss_01to18, # Average forest cover loss rate
+  gfw_avg_loss_01to18, # Absolute yearly loss
+  kpi_abs, # hectares of conservation priority (absolute value) each of them weighted by a factor of importance (1 med, 2 high, 3 very high)
+  kpi_prop, # proportion of the territory categorized as of conservation priority
+  rpi_abs, # restoration priority absolute (see above)
+  rpi_prop, # restoration priority proportional (see above kpi)
+  mean_sh_morena, # percentage of the municipality inhabitants that elected 4T current admin
+  dist_to_4Tmega # distance in meters to any of the megaproyects of current administration
+) %>% 
+  st_drop_geometry()
+```
+
+# Inspect the correlations between variables
+
+Now look at the pairs of variables and their correlation. Flag the suspicious ones
+- sv_final_num_beneficiarios_0 and sv_pfam_rec_0 seem to coincide strongly, but 
+there is an artifact there: they coincide in all zero values, but the non-zero are 
+quite independent. Still, it might be more correct for the sake of this specific
+experiment to not combine both
+- irs_20_index relates more strongly to sv_pfam_rec_0 than to sv_final_num_beneficiarios_0 
+because there is a natural trend of having higher poverty indexes where proportional 
+number of beneficiaries was very high, i.e. in small municipalities with few inhabitants
+that exhibit higher social lag
+- the larger the area21, the more absolute area prioritized for conservation, which 
+means that larger municipalities have more absolute area to conserve, makes sense, 
+and this also applies, with less strength, to restoration. Proportional area 
+exibits a completely different behavior, with conservation still holding the 
+positive correlation but restoration inverting the correlation: the larger the 
+proportion of area to be restored, the smaller the size of the municipality
+- gfw_avg_loss_01to18 and gfw_pondTreeCover are very strongly related to 
+sv_final_num_beneficiarios_0. These are not normalized and normalization
+fades the relationship, but important to keep in mind.
+- areas with lots of forest gfw_pondTreeCover have more absolute restoration and
+conservation priority
+
+What are the 'uncorrelated variables'? to find them, it is easy to eyeball all
+pie charts, beginning on top, hitting the full blue circle, and turn right
+
+- mean_sh_morena is quite uncorrelated
+- rpi_prop works well except with area21 and other priority values
+- rpi_abs is highly correlated to beneficiarios, area21, rural_households, TreeCover, avg_loss, the other abs priority kpi
+- kpi_prop relates slightly to gfw_area_forest_perc, kpi_abs, rpi_abs
+From the above we might deduct that given the correlation between kpi_abs and rpi_abs we will have to use the 
+proportional values if we want both to go into the same regression
+-gfw_avg_loss_01to18 is strongly related to sv_final_num_beneficiarios_0, slightly to area and forest_perc, very strongly to TreeCover 
+and to absolutes of priorities
+- gfw_avg_norm_loss_01to18 is quite uncorrelated (have in mind this is the avg rate of cover loss)
+-gfw_pondTreeCover is absolute tree cover and strongly relates with area21 and sv_final_num_beneficiarios_0, slightly
+with gfw_area_forest_perc and gfw_avg_loss_01to18 and the kpi_prop which is slightly unexpected
+- gfw_area_forest_perc is related to irs_20_index and i20_ind_lang_perc as described by Boege
+Indigenous language, poverty index and percentage of the area with forest are a cluster of correlation
+from which you would have to pick only one variable, but it is quite relevant to state this in the paper
+- irs_20_index has its strongest correlation with sf_pfam_rec_0 as mentioned above
+- i20_rural_households is not relevant for the analysis and related weakly to all
+- area21 is a confounding variable and relates to gfw_pondTreeCover, gfw_ag_loss_01to18 and the absolutes of priorities
+
+For the predicted variables we do not have to analyze correlations because we will not
+operate them in the regression, but is good to know that probably strong predictors
+will be Tree Cover and Avg Loss in the case of sv_final_num_beneficiarios_0 and 
+Social Lag for sv_pfam_rec_0
+
+```{r}
+correl_lmcan <- cor(lm_candidates %>% select(-CVEGEO, -irs20_degree), use = "complete.obs") 
+corrplot::corrplot.mixed(correl_lmcan,
+                             diag = "u",
+                             tl.pos = "lt",
+                         upper = "pie")
+```
+
+# Plot pairs to assess colinearity
+
+
+```{r message=FALSE, warning=FALSE}
+GGally::ggpairs(lm_candidates %>% select(-CVEGEO), aes(alpha = 0.5),
+                lower = list(continuous = "smooth")
+                )
+```
+### Clusters of correlated and colinear variables
+Cluster1: gfw_pondTreeCover | gfw_avg_loss_01to18 | kpi_abs | rpi_abs seem to be highly colinear
+Cluster2: gfw_area_forest_perc | irs_20_index | i20_ind_lang_perc as described by Boege, index and indigenous language highly colinear, a strong correlation
+Cluster3: kpi_abs | rpi_abs slightly too correlated but weakly collinear
+Cluster4: area21 | dist_to_4Tmega
+
+# Generate datasets that comply with certain rules
+
+In the attempt to compare the comparable, we want to generate a set of datasets 
+that have the same data structure for all variables. The three overall structures
+are
+- Unnormalized variables and include area21 that tends to be the coefficient
+that normalizes most of them
+- All variables normalized and consider area?
+- Allow categoricals instead of continuous (and therefore categorize the conservation and restoration indexes)
+
+### DS1: Unnormalized vars. NOT the greatest idea
+- area21
+  i20_rural_households
+  irs_20_index
+  gfw_pondTreeCover
+  gfw_avg_loss_01to18
+  kpi_abs (NOT IDEAL WITH TreeCover, avg_loss and rpi_abs)
+  rpi_abs
+  mean_sh_morena
+  dist_to_4Tmega
+  
+### DS2: Normalized variables 
+- area21 (does not conflict with normalized variables)
+  irs_20_index | gfw_area_forest_perc | i20_ind_lang_perc (ONE OF THIS CLUSTER)
+  gfw_avg_norm_loss_01to18
+  kpi_prop
+  rpi_prop
+  mean_sh_morena
+  dist_to_4Tmega
+  
+### DS3: Least correlation, max information
+- irs_20_index
+  gfw_area_forest_perc
+  gfw_pondTreeCover
+  gfw_avg_norm_loss_01to18
+  kpi_prop
+  rpi_prop
+  mean_sh_morena
+  dist_to_4Tmega
+
+```{r include=FALSE}
+# Setup for the models section
+library(caret)
+library(leaps)
+```
+
+
+# Attempt a model with all the variables through stepwise methods, back and forward (add1, drop1) for both num_bene and pfam
+
+# PREDICTING NUMBER OF BENEFICIARIES
+
+## Step Forward Approximation
+
+Build the trivial model
+
+```{r}
+model_allv_fwd <- lm(sv_final_num_beneficiarios_0 ~ 1, data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree))) # Modelling using only the mean
+summary(model_allv_fwd)
+# in the end this is the simplest model, adjusting the mean of the predicted variable
+# mean(lm_candidates$sv_final_num_beneficiarios_0)
+```
+
+```{r}
+ggplot(data = model_allv_fwd$model, aes(x = sv_final_num_beneficiarios_0)) +
+  geom_histogram(binwidth = 3) +
+  geom_vline(aes(xintercept = 261 ), color = "red") +
+  xlim(c(0, 5000)) + ylim(c(0,30))
+```
+
+Add the most representative variable to the model
+```{r}
+add1(model_allv_fwd, ~ area21 + i20_rural_households + irs_20_index + i20_ind_lang_perc + gfw_area_forest_perc + gfw_pondTreeCover + gfw_avg_norm_loss_01to18 + gfw_avg_loss_01to18 + kpi_prop + rpi_prop + mean_sh_morena + dist_to_4Tmega , test = "F")
+```
+Add the variable with the highest F, which is the absolute loss per year of 
+forest cover
+
+```{r}
+model_allv_fwd <- lm(sv_final_num_beneficiarios_0 ~ gfw_avg_loss_01to18, data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree)))
+summary(model_allv_fwd)
+```
+```{r}
+ggplot(data = model_allv_fwd$model, aes(x = sv_final_num_beneficiarios_0, y = gfw_avg_loss_01to18)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  geom_vline(aes(xintercept = mean(model_allv_fwd$model$sv_final_num_beneficiarios_0)), color = "red")
+```
+
+We have to look at the linear model assumptions to see if this would make sense as 
+a model
+
+```{r}
+plot(model_allv_fwd)
+```
+
+It does not make sense and is calling for a transformation of the 
+predictor. 
+
+What if we transform the variables? Or attempt to use a GLM? I tried 
+several things in this sandbox but none of them worked, the gamma distribution
+will not work due to the zeroes...
+
+```{r}
+model_allv_fwd2 <- glm((sv_pfam_rec_0 +1) ~ (gfw_avg_loss_01to18), family = Gamma, data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree)))
+summary(model_allv_fwd2)
+plot(model_allv_fwd2)
+```
+
+Still we can carry on to see if we manage to hit a good model
+after adding more terms
+
+Now add the remainder most representative variable, but I am going to exclude 
+gfw_pondTreeCover because it has a very strong correlation (0.46) with gfw_avg_loss_01to18
+
+```{r}
+add1(model_allv_fwd, ~ . + area21 + i20_rural_households + irs_20_index + i20_ind_lang_perc + gfw_area_forest_perc + gfw_avg_norm_loss_01to18 + kpi_prop + rpi_prop + mean_sh_morena + dist_to_4Tmega , test = "F")
+```
+Again, have a look at the residuals to understand if model is
+a good fit
+
+```{r}
+plot(model_allv_fwd)
+```
+
+Next variable to be included, is not, as expected, is irs_20_index! but i20_rural_households
+
+```{r}
+model_allv_fwd <- lm(sv_final_num_beneficiarios_0 ~ gfw_avg_loss_01to18 + i20_rural_households, data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree)))
+summary(model_allv_fwd)
+```
+How good is that new model
+```{r}
+plot(model_allv_fwd)
+```
+
+
+Any other variable to add? It is clear that this is going nowhere but I want to
+take it to the last consequences
+
+```{r}
+add1(model_allv_fwd, ~ . + area21 + i20_rural_households + irs_20_index + i20_ind_lang_perc + gfw_area_forest_perc + gfw_avg_norm_loss_01to18 + kpi_prop + rpi_prop + mean_sh_morena + dist_to_4Tmega, test = "F")
+```
+
+Maybe it could be area21 but the construction is slightly weak. Still,
+there is little correlation with the current variables, so will add it
+
+```{r}
+model_allv_fwd <- lm(sv_final_num_beneficiarios_0 ~ gfw_avg_loss_01to18 + irs_20_index + i20_rural_households, data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree)))
+summary(model_allv_fwd)
+```
+Will remove indigenous language because it is too strongly correlated with 
+irs_20_index and could not be included
+
+```{r}
+add1(model_allv_fwd, ~ . + area21 + gfw_area_forest_perc + gfw_avg_norm_loss_01to18 + kpi_prop + rpi_prop + mean_sh_morena , test = "F")
+```
+Maybe the last one to be added is the restoration index
+
+```{r}
+model_allv_fwd <- lm(sv_final_num_beneficiarios_0 ~ gfw_avg_loss_01to18 + irs_20_index + area21 + i20_rural_households + rpi_prop, 
+                     data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree)))
+summary(model_allv_fwd)
+```
+But this last one does not really add any value at all to the model
+I would keep at the most the 2 first variables, but can only explain 35% of
+the variation
+
+Attempt to use the multiplicative term, which seems to give wonderful
+results, but it is very likely to incorporate an area and population effect
+in the sense that large and busy municipalities are way more likely to have 
+many beneficiaries
+
+```{r}
+model_allv_fwd_mult <- lm(sv_final_num_beneficiarios_0 ~ gfw_avg_loss_01to18 * irs_20_index * i20_rural_households * rpi_prop, 
+                     data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree)))
+summary(model_allv_fwd_mult)
+```
+
+Still, the fit of the model is inadequate and we have to discard it, as it shows
+2 extreme outliers, a funneling effect in the residuals, and departs from 
+normality schematically
+
+```{r}
+plot(model_allv_fwd_mult)
+```
+
+
+-- END OF STEP FORWARD --
+
+## Step Backward Approximation
+
+Begin with a model that includes all
+
+```{r}
+model_allv_back <- lm(sv_final_num_beneficiarios_0 ~ ., data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree, -sv_pfam_rec_0))) # Modelling using only the mean
+summary(model_allv_back)
+```
+Keeping only the relevant terms, and discarding language because it is 
+strongly related to households as well as tree cover that belongs to the
+same cluster of average cover loss
+
+```{r}
+model_allv_back <- lm(sv_final_num_beneficiarios_0 ~ i20_rural_households + irs_20_index + gfw_avg_loss_01to18 + kpi_prop + rpi_abs,
+                      data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree, -sv_pfam_rec_0))) 
+# Keeping only relevants
+summary(model_allv_back)
+```
+Now drop one using the F test, based on the disencouraging p values 
+of the restoration priorities
+
+```{r}
+drop1(model_allv_back, ~. , test = "F")
+```
+
+Removing rpi_abs and kpi_prop as suggested by drop1
+
+```{r}
+model_allv_back <- lm(sv_final_num_beneficiarios_0 ~ i20_rural_households + irs_20_index + gfw_pondTreeCover + gfw_avg_loss_01to18,
+                      data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree, -sv_pfam_rec_0))) 
+# Keeping only relevants
+summary(model_allv_back)
+```
+We can now look at the conditions for the model to be a good fit
+
+```{r}
+plot(model_allv_back)
+```
+
+We could have skipped the step of removing the confounding variables 
+that are highly correlated (because we do not know how much they affect the model) but there
+is not a clear improvement anyways, so we would end up with the same model
+as in the forward selection
+
+```{r}
+model_allv_back <- lm(sv_final_num_beneficiarios_0 ~ i20_rural_households + i20_ind_lang_perc + irs_20_index + gfw_avg_loss_01to18 + gfw_pondTreeCover, data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree, -sv_pfam_rec_0))) 
+# Keeping all relevants suggested in the beginning
+summary(model_allv_back)
+```
+See how the whole model ended up satisfying the conditions
+
+```{r}
+plot(model_allv_back)
+```
+
+Both models above exhibit a funneling effect for residuals and strong outliers
+that are fully undesired
+
+
+# PREDICTING PERCENTAGE OF FAMILIES RECRUITED
+
+## Step Forward Approximation
+
+Build the trivial model
+
+```{r}
+model_allv_fwd_pfam <- lm(sv_pfam_rec_0 ~ 1, data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree))) # Modelling using only the mean
+summary(model_allv_fwd_pfam)
+# in the end this is the simplest model, adjusting the mean of the predicted variable
+# mean(lm_candidates$sv_final_num_beneficiarios_0)
+
+```
+Add the most representative variable to the model
+```{r}
+add1(model_allv_fwd_pfam, ~ . + area21 + i20_rural_households + irs_20_index + i20_ind_lang_perc + gfw_area_forest_perc + gfw_pondTreeCover + gfw_avg_norm_loss_01to18 + gfw_avg_loss_01to18 + kpi_prop + rpi_prop + mean_sh_morena + dist_to_4Tmega , test = "F")
+```
+In this case, the obvious and natural irs_20_index is the best predictor
+
+```{r}
+model_allv_fwd_pfam <- lm(sv_pfam_rec_0 ~ irs_20_index, data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree)))
+summary(model_allv_fwd_pfam)
+```
+
+Add another variable to the model
+
+```{r}
+add1(model_allv_fwd_pfam, ~ . + area21 + i20_rural_households + i20_ind_lang_perc + gfw_area_forest_perc + gfw_pondTreeCover + gfw_avg_norm_loss_01to18 + gfw_avg_loss_01to18 + kpi_prop + rpi_prop + mean_sh_morena + dist_to_4Tmega, test = "F")
+```
+
+Perfect, total tree cover is not significantly correlated to irs_20_index
+
+```{r}
+model_allv_fwd_pfam <- lm(sv_pfam_rec_0 ~ irs_20_index + gfw_pondTreeCover, data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree)))
+summary(model_allv_fwd_pfam)
+```
+
+```{r}
+add1(model_allv_fwd_pfam, ~ . + area21 + i20_rural_households + i20_ind_lang_perc + gfw_area_forest_perc + gfw_avg_norm_loss_01to18 + gfw_avg_loss_01to18 + kpi_prop + rpi_prop + mean_sh_morena + dist_to_4Tmega, test = "F")
+```
+
+Maybe we can add rural households, but indigenous language percentage is too strongly
+correlated with irs
+
+```{r}
+model_allv_fwd_pfam <- lm(sv_pfam_rec_0 ~ irs_20_index + gfw_pondTreeCover + i20_rural_households, data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree)))
+summary(model_allv_fwd_pfam)
+```
+The contributions of adding rural households are insignificant
+We can look at the distribution of errors and other assumptions
+
+```{r}
+# this is for the purely additive model
+plot(model_allv_fwd_pfam)
+```
+
+The model departs from normality abruptly, although outliers are better controlled
+The error distribution for a MLR is very unfamiliar
+
+We can see below what would have happen if on top we add the multiplicative
+terms to the model, in which orthogonality of parameters is higher than before
+because the area effect has been erradicated by normalization
+
+```{r}
+model_allv_fwd_pfam2 <- lm(sv_pfam_rec_0 ~ irs_20_index * gfw_pondTreeCover * i20_rural_households, data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree)))
+summary(model_allv_fwd_pfam2)
+```
+What is the compliance with assumptions of the multiplicative model?
+
+```{r}
+plot(model_allv_fwd_pfam2)
+```
+
+Our multiplicative model does not comply with almost any of the
+LINE assumptions
+Linear behaviour of the model
+Independence of errors -- the closer you get to a small error, the more errors there are
+Normality of the errors at each point (although this is not really for us that crucial)
+Equal variance
+
+## Step Backward Approximation
+
+Begin with a model that includes all
+
+```{r}
+model_allv_back_pfam <- lm(sv_pfam_rec_0 ~ ., data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree, -sv_final_num_beneficiarios_0))) # Modelling using only the mean
+summary(model_allv_back_pfam)
+```
+See what to remove
+
+```{r}
+drop1(model_allv_back_pfam, ~ . , test = "F")
+```
+The above graph is suggesting to fit a model with the same parameters as 
+those used in the step forward, so there is no need because we already did 
+that and failed to succeed
+
+We can try to disentangle the interactions of poverty and absolute forest cover
+
+```{r}
+model_allv_back_pfam <- lm(sv_pfam_rec_0 ~ irs_20_index * gfw_pondTreeCover, 
+                           data = drop_na(lm_candidates %>% select(-CVEGEO, -irs20_degree, -sv_final_num_beneficiarios_0))) # Modelling using only the mean
+summary(model_allv_back_pfam)
+```
+
+## Conclusion
+
+If we do not add multiplicative terms, the best we might end up approximating
+*Number of Beneficiaries* is probably 
+below 36% of R-squared, which is not that far from the linear regression presented
+in the poster showing Number of Beneficiaries VS Forest Loss per Year
+
+When incorporating the multiplicative terms, the R-squared duplicates as shown in
+*summary(model_allv_fwd_mult)* but this is very likely to be an area effect, 
+as Jeanine said, because municipalities with larger areas and larger populations
+are less constrained in the selection of beneficiaries
+
+The figure of *Percentage of Families Recruited* is very hard to approximate
+and the best estimate we could get is below 16% R-squared, which is virtually 
+irrelevant for 3 variables. A simpler model with *Social Lag Index* as only
+predictor conveys only 10% R-squared
+
+We found two very interesting clusters of correlation, A) one that was quite well
+predicted by Jeanine, between absolute tree cover and absolute annual cover loss
+(that extrapolates to absolute surface of priority areas very naturally). The other
+one is explained by Boege in the book Biocultural Heritage of Indigenous Peoples
+that strongly relates Percentage of the Municipality with Forest Cover, 
+Percentage of Indigenous Language Speakers and the Social Lag (poverty) Index
+
+# PREDICTING PARTICIPATION AND THEN, DEGREE OF PARTICIPATION
+## Participation through GLM - Binomial
+
+After juggling with how to make these models work and a good dive into what
+it means to fit a linear model using the course [STAT 501 from Penn State](https://online.stat.psu.edu/stat501/)
+I came to the clear understanding that trying to make a model that encompasses
+at the same time the YES-NO answer of What municipalities were selected? and the 
+answer of INTENSITY -- to what degree was each municipality allocated the program
+benefits simply will not work.
+
+The right approach is to split the problem in 2 questions:
+Q1:
+- What variables drove the participation of a municipality in your population?
+here, our population are those 1971 municipalities of which 1005 have SV
+Q2:
+- What variables mediated the intensity of adoption/allocation/participation
+in those municipalities that chose to participate?
+here, our population is only comprised of the municipalities that adopted the
+program (at least have 1 beneficiary)
+
+And with those two questions, the models begin to look as they should. In the next 
+section, we ask both question separately and address them separately using purposefully named 
+datasets and models.
+
+In the following example we include the binary variable *sv_participates* which
+will be our predicted binary random variable to which we apply a generalized
+binomial linear model.
+
+```{r}
+lm_candidates2 <- z %>% select(
+  CVEGEO, # Just to have an identifier at hand
+  sv_participates, # participation, binary
+  sv_pfam_rec, # This percentage is calculated only over those municipalities
+  # with at least one beneficiary
+  area21, # Might be used
+  i20_rural_households, # Here important to note that metropolitan municipalities have 0 households
+  irs_20_index, # continuous
+  irs20_degree, # categorical
+  i20_ind_lang_perc, # This one likely collinear with IRS indexes
+  gfw_area_forest_perc, # Percentage of the municipality covered by forest
+  gfw_pondTreeCover, # Absolute area of forest in municipality
+  gfw_avg_norm_loss_01to18, # Average forest cover loss rate
+  gfw_avg_loss_01to18, # Absolute yearly loss
+  kpi_prop, # proportion of the territory categorized as of conservation priority
+  rpi_prop, # restoration priority proportional (see above kpi)
+  mean_sh_morena, # percentage of the municipality inhabitants that elected 4T current admin
+  dist_to_4Tmega # distance in KM to the closest megaproyect of 4T
+) %>% 
+  st_drop_geometry() # %>% 
+  # mutate(
+  #   sv_participates = as.logical(sv_participates)
+  # )
+```
+
+Again the correlation check just in case things shift with those variables
+that got slightly modified, and we can see that some of the clusters got 
+dissagregated, and of particular importance is the irs_20 and area_forest_perc
+
+```{r}
+correl_lmcan2 <- cor(lm_candidates2 %>% select(-CVEGEO, -irs20_degree, -sv_participates), use = "complete.obs") 
+corrplot::corrplot.mixed(correl_lmcan2,
+                             diag = "u",
+                             tl.pos = "lt",
+                         upper = "pie")
+```
+
+We can look at the distributions now, but in this case for the binomial model
+there is no great change of the variables
+
+```{r message=FALSE, warning=FALSE}
+GGally::ggpairs(lm_candidates2 %>% select(-CVEGEO), aes(alpha = 0.5),
+                lower = list(continuTous = "smooth")
+                )
+```
+
+To fit a model for participation, we apply a generalized linear model that 
+aims for a binomial distribution of the explained variable
+
+```{r}
+ds <- lm_candidates2 %>%
+                  select(
+                  -c(CVEGEO, sv_pfam_rec, irs20_degree)) #%>% 
+                  #drop_na()
+
+model_gb <- glm(formula = sv_participates ~ ., 
+                family = binomial, 
+                data = ds
+                )
+
+summary(model_gb)
+```
+We get a warning because it is very difficult for the model to make predictions
+for some scenarios (municipalities), as we can see when we print some of the predicted values
+
+```{r}
+pred_table <- bind_cols(
+  fitted = model_gb$fitted.values,
+  sv_participates = model_gb$model$sv_participates,
+  poverty = model_gb$model$irs_20_index ,
+  dist_to_megaproject = model_gb$model$dist_to_4Tmega,
+  conservation_index = model_gb$model$kpi_prop,
+  prop_forested = model_gb$model$gfw_area_forest_perc
+  )
+pred_table %>% slice_sample(n = 20)
+```
+
+Another thing we want to see is the range in which our predictions live, the 
+interquartile range 
+```{r}
+summary(model_gb$fitted.values)
+```
+
+If we were predicting, what percentage of our municipalities with SV 
+we would have located by using the model and rounding the output?
+
+```{r}
+tn <- table(pred_table$sv_participates)[[2]] # There are 996 participating
+
+# Calculates the accuracy of the model
+table(pred_table %>% 
+        select(fitted, sv_participates) %>%
+        mutate(fitted = round(fitted))  %>% 
+        slice_head(n = tn))[[2]]/tn
+```
+
+We can assess the fit of the model by looking at the assumptions of 
+linearity and normality
+
+```{r}
+plot(model_gb)
+```
+
+We can begin the variable dropping because this model is looking good, 
+to do this, drop1 in this case gives us the AIC given that we removed
+the variable, and we want to keep minimizing the AIC which is `r model_gb$aic`
+and can be found to be the first number of the table
+
+```{r}
+drop1(object = model_gb)
+```
+Remove a couple of non significant var, and I am removing avg_loss because it 
+is highly correlated with TreeCover (up to .70)
+
+```{r}
+model_gb <- glm(formula = sv_participates ~ area21 + i20_rural_households + irs_20_index + i20_ind_lang_perc + gfw_area_forest_perc + gfw_pondTreeCover + gfw_avg_norm_loss_01to18 + kpi_prop + dist_to_4Tmega, 
+                family = binomial, 
+                data = ds
+                )
+
+summary(model_gb)
+```
+New group of exclusions
+
+```{r}
+drop1(model_gb)
+```
+Seems like area, indigenous languages and rural households can go
+
+```{r}
+model_gb <- glm(formula = sv_participates ~ irs_20_index + gfw_area_forest_perc + gfw_pondTreeCover + gfw_avg_norm_loss_01to18 + kpi_prop + dist_to_4Tmega, 
+                family = binomial, 
+                data = ds
+                )
+
+summary(model_gb)
+```
+```{r}
+drop1(object = model_gb)
+```
+There is no other variable to remove, and if we were to remove one it would 
+be norm_loss, which makes sense because we have tree forest cover variables
+
+```{r}
+model_gb <- glm(formula = sv_participates ~ gfw_area_forest_perc + irs_20_index + gfw_pondTreeCover + kpi_prop + dist_to_4Tmega, 
+                family = binomial, 
+                data = ds
+                )
+
+summary(model_gb)
+```
+
+```{r}
+plot(model_gb)
+```
+We want to see how the regression looks too, and found the way to do it 
+in this website [Nick Michalak](https://nickmichalak.com/post/2019-12-11-logistic-regression-in-r/logistic-regression-in-r/)
+```{r}
+ggplot(data = bind_cols(model_gb$model, fitted = model_gb$fitted.values)) +
+  geom_point(mapping = aes(x = fitted, y = sv_participates)) +
+  geom_smooth(mapping = aes(x = fitted, y = sv_participates), color = "red", method = "glm", formula = y ~ x, method.args = list(family = binomial(link = "logit")), se = FALSE)
+```
+To learn more about the model, apply another package that gives you more
+metrics
+
+```{r}
+rms::lrm(formula = sv_participates ~ gfw_area_forest_perc + irs_20_index + gfw_pondTreeCover + kpi_prop + dist_to_4Tmega,
+                data = ds)
+
+```
+
+
+From the graph we see commission is high because we fit some values as (almost) 1 when they 
+should be 0, but there is a smaller error of omission, almost all participating municipalities
+get a probablity above 12% of participating and the greatest majority gets a probability 
+above 35% if they are participating
+
+I am quite happy as of now with how the fitting went, it seems according to 
+the following tutorial that we have a very well adjusted model, with some 
+outliers as expected from a large dataset, but nothing outside of what is tolerable
+https://bookdown.org/egarpor/PM-UC3M/glm-diagnostics.html
+
+We can also conduct the test of deviances according to 
+[Extending the Linear Model in R](https://ebookcentral.proquest.com/lib/ubc/detail.action?docID=199149)
+
+```{r}
+pchisq(deviance(model_gb), df.residual(model_gb), lower.tail = FALSE)
+# We want this value to be above 0.05 when we are testing for fit with a larger
+# population, which is not our case.
+```
+
+Can we improve further?
+
+```{r}
+drop1(object = model_gb)
+```
+
+What I interpret from above is that all vars except Tree Cover  are 
+contributing importantly to the model's fit and none of them should be removed
+because they bump the AIC for more than 12 points
+
+```{r}
+model_gb <- glm(formula = sv_participates ~ irs_20_index + kpi_prop + dist_to_4Tmega + gfw_area_forest_perc, 
+                family = binomial, 
+                data = ds
+                )
+
+summary(model_gb)
+```
+We check on the relevance of all the remainder variables
+
+```{r}
+drop1(object = model_gb)
+```
+Run a final inspection of model_gb to see that it does not look so steep as 
+the rest because we have removed some terms with a large range
+
+```{r}
+plot(model_gb)
+```
+A plot to compare fit to actual values shows that 
+certainly the model is way less precise and quite undecisive when
+facing a non-participating municipality. I do not like it anymore
+
+```{r}
+ggplot(data = bind_cols(model_gb$model, fitted = model_gb$fitted.values)) +
+  geom_point(mapping = aes(x = fitted, y = sv_participates)) +
+  geom_smooth(mapping = aes(x = fitted, y = sv_participates), color = "red", method = "glm", formula = y ~ x, method.args = list(family = binomial(link = "logit")), se = FALSE)
+```
+
+## Conclusions
+We found an optimized model that suggests that the most important variable is 
+forest percentage and from there we move to conservation priority index and then 
+later to poverty. Distance to megaprojects continues to be a strong predictor in 
+fourth place. Although a bell rings to remember we put poverty and forest percentage 
+in the same cluster we can see that in the new correlation plot they appear to have
+lost that strong bond.
+
+# Automated recommendations 
+
+Explore what recommendation would be for the large dataset, that has some few correlated variables
+Feed all variables first and we get priorities
+- 1. Percentage of municipality forested
+- 2. Conservation priority
+- 3. Tree cover
+- 4. Poverty
+
+```{r}
+# Apply automated model selection
+# Once the variables have distilled themselves by showing an appropriate behaviour
+# in both stepwise methods, optimize the model with an automated model selection
+# by using some package like leaps that assesses the fit of all possible subsets
+
+library(leaps)
+model_rec_leaps <- leaps::regsubsets(sv_participates ~ ., data = ds)
+summary_mrl <- summary(model_rec_leaps)
+
+fit_stats <- data.frame(
+  Adj.R2 = which.max(summary_mrl$adjr2),
+  CP = which.min(summary_mrl$cp),
+  BIC = which.min(summary_mrl$bic)
+)
+
+summary_mrl
+```
+
+We can proceed to apply the model that was recommended by the algorithm, in this 
+case, the maximum number of variables is 8, but the last recommended, indigenous
+language, has too strong of a correlation to be viable, so we use 7
+
+```{r}
+model_pfam_rec_all <- glm(formula = sv_participates ~ i20_rural_households + irs_20_index + gfw_pondTreeCover + kpi_prop + dist_to_4Tmega + gfw_area_forest_perc + mean_sh_morena, 
+                family = binomial, 
+                data = ds
+                )
+
+summary(model_pfam_rec_all)
+```
+Let us look at the fit of this recommended model (very similar to those developed
+above with the step forward)
+
+```{r}
+plot(model_pfam_rec_all)
+```
+
+This is a very beautifully fit model, probably with the most harmonic distribution
+of all, and with the only disadvantage of deviating from normality in the extremes
+to a larger degree than the other optimized model
+
+```{r}
+ggplot(data = bind_cols(model_pfam_rec_all$model, fitted = model_pfam_rec_all$fitted.values)) +
+  geom_point(mapping = aes(x = fitted, y = sv_participates)) +
+  geom_smooth(mapping = aes(x = fitted, y = sv_participates), color = "red", method = "glm", formula = y ~ x, method.args = list(family = binomial(link = "logit")), se = FALSE)
+```
+
+We should apply the procedure above but using only uncorrelated variables, those
+that I already built in the DS1, DS2 and DS3
+
+```{r}
+recommend_DS2 <- regsubsets(sv_participates ~ ., data = ds %>% select(sv_participates, area21, irs_20_index, gfw_avg_norm_loss_01to18,  kpi_prop, rpi_prop,  mean_sh_morena) %>% drop_na())
+summary_mrl <- summary(recommend_DS2)
+
+fit_stats <- data.frame(
+  Adj.R2 = which.max(summary_mrl$adjr2),
+  CP = which.min(summary_mrl$cp),
+  BIC = which.min(summary_mrl$bic)
+)
+
+summary_mrl
+```
+This recommendation provides a very different set of variables, we should see
+how the model looks like.
+
+```{r}
+model_rec_ds2 <- glm(sv_participates ~ area21 + irs_20_index + rpi_prop,
+                     data = ds,
+                     family = binomial
+                     ) 
+# Keeping only relevants
+summary(model_rec_ds2)
+
+```
+The model has very low performance, totally undesired
+
+## PREDICTING INTENSITY OF PARTICIPATION
+
+We are changing the question here, and now we want to analyse what drove
+intensity of recruitment, and for this we will just focus on those municipalities
+that are participating in SV
+
+```{r}
+lm_candidates3 <- lm_candidates2 %>% filter(sv_participates == 1) %>% select(-CVEGEO, -sv_participates, -irs20_degree)
+```
+
+We can have a look at the new correlation structure
+
+```{r}
+correl_lmcan3 <- cor(lm_candidates3, use = "complete.obs") 
+corrplot::corrplot.mixed(correl_lmcan3,
+                             diag = "u",
+                             tl.pos = "lt",
+                         upper = "pie")
+```
+We have to keep an eye on the variable area21 and the relationship between
+forest cover and avg forest cover loss
+
+# Automated recommendations 
+
+Explore what are the recommended variables by an algorithm, that has some few correlated variables
+Feed all variables first and we get 
+- 1. Poverty
+- 2. Conservation Priorities
+- 3. Area and Rural Households
+- 4. The combination of 2 and 3
+
+We are seeing a very interesting phenomenon, which is that when added independently
+to the model, neither area nor rural households explain as much as restoration priority,
+however, when we add area and rural households together, they explain more than 
+conservation priority
+
+```{r}
+# Apply automated model selection
+
+library(leaps)
+model_rec_leaps <- leaps::regsubsets(sv_pfam_rec ~ ., data = lm_candidates3 )
+summary_mrl <- summary(model_rec_leaps)
+
+fit_stats <- data.frame(
+  Adj.R2 = which.max(summary_mrl$adjr2),
+  CP = which.min(summary_mrl$cp),
+  BIC = which.min(summary_mrl$bic)
+)
+
+summary_mrl
+```
+
+Important to see the distributions of these four variables
+
+```{r message=FALSE, warning=FALSE}
+GGally::ggpairs(lm_candidates3 %>% select(sv_pfam_rec, irs_20_index, kpi_prop, area21, i20_rural_households), aes(alpha = 0.5),
+                lower = list(continuous = "smooth")
+                )
+```
+At least we want to explain something that is kind of normal, but not really,
+so probably what we want is another glm that fits the curve better, using a 
+gamma distribution as the target
+
+We can proceed to apply the linear model that was recommended by the algorithm, in this 
+case, using the first 4 variables because they seem to be the most explanatory
+
+```{r}
+model_pfam_rec_all <- lm(formula = sv_pfam_rec ~ irs_20_index + kpi_prop + area21 + i20_rural_households,
+                data = lm_candidates3
+                )
+
+summary(model_pfam_rec_all)
+```
+
+The model explains quite a *model_pfam_rec_all* small part of the variation, now is 
+the turn to look at the fit
+
+```{r}
+plot(model_pfam_rec_all)
+```
+The fit is not ideal, ther is a very ugly cluster, and the random error
+has clearly two biased tails, so the gamma distribution might improve
+the fit substantially
+
+```{r}
+gamma_model_pfam_rec_all <- glm(formula = sv_pfam_rec ~ irs_20_index + kpi_prop + area21 + i20_rural_households, 
+                                family = Gamma(link = "log"), 
+                                data = lm_candidates3
+                )
+
+summary(gamma_model_pfam_rec_all)
+```
+We can assess how this new model fits
+
+```{r}
+plot(gamma_model_pfam_rec_all)
+```
+
+
+How does the model look if we just keep the two first variables?
+
+```{r}
+gamma_model_pfam_rec_all2 <- glm(formula = sv_pfam_rec ~ irs_20_index + kpi_prop,
+                                family = Gamma(link = "log"),
+                                data = lm_candidates3
+                )
+
+summary(gamma_model_pfam_rec_all2)
+```
+
+How does this model fit?
+
+```{r}
+plot(gamma_model_pfam_rec_all2)
+```
+
+We can apply the variable selection for the linear model
+but using only uncorrelated variables, those
+that I already built in the DS1, DS2 and DS3
+
+```{r}
+recommend_DS2 <- regsubsets(sv_pfam_rec ~ ., data = lm_candidates3 %>% select(sv_pfam_rec, area21, irs_20_index, gfw_avg_norm_loss_01to18,  kpi_prop, rpi_prop,  mean_sh_morena, dist_to_4Tmega) %>% drop_na())
+summary_mrl <- summary(recommend_DS2)
+
+fit_stats <- data.frame(
+  Adj.R2 = which.max(summary_mrl$adjr2),
+  CP = which.min(summary_mrl$cp),
+  BIC = which.min(summary_mrl$bic)
+)
+
+summary_mrl
+```
+This recommendation outputs the same model up to the third variable, so will not 
+follow up
+
+There is a strange phenomenon in the first selection, which is that rural households
+jumps into the model together with area, suggesting that all the zeros of the former
+might make area relevant, so we can opt to not add it. If we remove it, we get poverty
+and conservation index as first two, but then indigenous language shows up, but that
+is strongly correlated with poverty, so I will skip it and select the subsequent
+two variables.
+
+After all these considerations we get the following automated recommendations
+
+- Poverty
+- Conservation index
+- Percentage of area forested (skipped ind lang)
+- Tree Cover absolute
+
+```{r}
+# Apply automated model selection, with rural households removed
+
+library(leaps)
+model_rec_leaps <- leaps::regsubsets(sv_pfam_rec ~ ., data = lm_candidates3 %>% select(-i20_rural_households) )
+summary_mrl <- summary(model_rec_leaps)
+
+fit_stats <- data.frame(
+  Adj.R2 = which.max(summary_mrl$adjr2),
+  CP = which.min(summary_mrl$cp),
+  BIC = which.min(summary_mrl$bic)
+)
+
+summary_mrl
+```
+
+Important to see the distributions of these four variables
+
+```{r message=FALSE, warning=FALSE}
+GGally::ggpairs(lm_candidates3 %>%
+                  select(sv_pfam_rec, irs_20_index, kpi_prop, gfw_area_forest_perc, gfw_pondTreeCover),
+                aes(alpha = 0.5),
+                lower = list(continuous = "smooth")
+                )
+```
+We can try the gamma model again, although maybe a transformation of the conservation
+index and tree cover can leave us on a better place.
+
+Important to see the behavior of the variables
+
+```{r}
+summary(lm_candidates3 %>%
+                  select(sv_pfam_rec, irs_20_index, kpi_prop, gfw_area_forest_perc, gfw_pondTreeCover))
+```
+I will transform kpi by taking a sqr root and tree cover with a log
+
+```{r}
+tester <- lm_candidates3 %>%
+                  select(sv_pfam_rec, irs_20_index, kpi_prop, gfw_area_forest_perc, gfw_pondTreeCover) %>% 
+                  mutate(
+                    sqrt_kpi = sqrt(kpi_prop),
+                    l_tree_cover = log(gfw_pondTreeCover),
+                    sqrt_pfam = sqrt(sv_pfam_rec),
+                    sqrt_tree_cover = sqrt(gfw_pondTreeCover)
+                  )
+```
+
+Review the distributions now
+
+```{r message=FALSE, warning=FALSE}
+GGally::ggpairs(tester,
+                aes(alpha = 0.5),
+                lower = list(continuous = "smooth")
+                )
+```
+
+Let us see the histogram of that sqrt of pfam
+
+```{r}
+ggplot(data = tester) + 
+  geom_freqpoly(aes(x = sqrt_pfam), bins = 50) +
+  geom_freqpoly(aes(x = sv_pfam_rec), color = "red")
+```
+We can apply the linear model now
+
+```{r}
+lmodel_tr <- lm(sqrt_pfam ~ irs_20_index + kpi_prop + gfw_pondTreeCover + gfw_area_forest_perc,
+                data = tester)
+summary(lmodel_tr)
+```
+```{r}
+plot(lmodel_tr)
+```
+The model above fits much better that any other model I had seen before
+
+I want to ask if the variables we have to predict sqrt_pfam are still the ones
+we picked from the beginning, while the transformations seems definitely the way 
+to go in this case
+
+```{r}
+model_rec_leaps_trns <- leaps::regsubsets(sqrt(sv_pfam_rec) ~ ., data = lm_candidates3 )
+summary_mrl <- summary(model_rec_leaps_trns)
+
+fit_stats <- data.frame(
+  Adj.R2 = which.max(summary_mrl$adjr2),
+  CP = which.min(summary_mrl$cp),
+  BIC = which.min(summary_mrl$bic)
+)
+
+summary_mrl
+```
+And we get the same formula, so should not worry about that
+
+```{r}
+fit_stats
+```
+
+We want to know more about the model 
+
+```{r}
+lmodel_tr2 <- lm(sqrt_pfam ~ irs_20_index * kpi_prop * gfw_pondTreeCover * gfw_area_forest_perc,
+                data = tester)
+summary(lmodel_tr2)
+```
+

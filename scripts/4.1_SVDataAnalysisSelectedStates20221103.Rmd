@@ -1,0 +1,1396 @@
+---
+title: "Second Iteration on SV analysis"
+author: "Pablo"
+date: "2022-08-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(cowplot)
+library(ggpubr)
+library(lm.beta)
+```
+
+## SV, FLR and the story of a large recruitment
+
+All data sourcing and calculations are put together in *3_db_integration* for 
+clarity purposes, main db is called z.
+
+```{r dataNconstants, include=FALSE, echo=FALSE}
+# Data
+source("paper1/scrP1/3_db_integration.R") 
+
+# Useful functions
+source(file = "scripts/mappingSetup.R")
+source(file = "scripts/functions/quickMaps.R")
+afplot <- function(p){
+  p + theme_light() +
+    theme(legend.position = "none",
+          legend.key.size = unit(18, "pt")) +
+    scale_fill_brewer(palette = pal, direction = -1) + 
+    theme(legend.position = "none",
+          axis.title = element_text(size = 14),
+          axis.text = element_text(size = 14),
+          plot.title = element_text(size = 18)
+    )
+}
+
+pal <- "RdYlBu"
+rlcol <- "purple"
+gr <- "#38c73f"
+path <- "paper1/ploP1/"
+state_borders <- read_sf("data/raw/spatial/mgs/INEGI_2021-12_MarcoGeoestadistico/mg2021_integrado/conjunto_de_datos/00ent.shp")
+```
+
+## A key modification to the Database 'z'
+
+Given that for the linear models we seem to be struggling with some of the 
+variables that have a wide range countrywide, we made the decision of filtering
+our dataset and analysis to the scope of those states selected by SV. Here I 
+conduct a quick exploration of what it means and to what extent it changes the
+database
+
+```{r}
+sv_active_states <- z %>% group_by(CVE_ENT) %>% 
+  st_drop_geometry() %>% 
+  summarise(state_total = sum(sv_final_num_beneficiarios_0)) %>% 
+  filter(state_total > 18) 
+# reports 21 states with SV and here I am removing Zacatecas because it will just
+# generate more confusion to keep a state with 18 beneficiaries
+
+z <- z %>% filter(CVE_ENT %in% pull(sv_active_states, CVE_ENT))
+```
+
+## Other representations of the SV effort
+
+Jeanine said she did not like the poster's map. We can visualize effort in other
+ways.
+
+Sembrando Vida density with the degree of poverty borders
+
+```{r}
+altmap1 <- tm_shape(z) +
+  tm_fill(col = "sv_area_trans_perc",
+          breaks = seq(from = 0, to = 0.4, by= 0.05),
+          title = "Sembrando Vida density\nby percentage of\nmunicipal area transformed") 
+altmap1
+
+```
+
+
+## Storyline 1: SV promised to recruit the poor, did it get there?
+
+At last I am happy with the quantitative explanation I managed to set up, 
+which goes along the lines of: 
+- The majority of the families recruited are not in poor municipalites
+- However, when you look at the proportions of the total population in
+each degree of poverty, poorer people were more likely to be reached by
+the program.
+
+In the WAC poster, I was slightly imprecise when I used marginalization and 
+poverty as synonyms, because SV is using another index, the Indice de Rezago Social to guide
+their recruitment efforts. So for me is time to re-run the calculations of 
+*"Is restoration addressing poverty"* with the new index to see what comes
+out of it.
+
+```{r}
+map1 <- tm_shape(z %>% mutate(sv_final_num_beneficiarios = pmin(sv_final_num_beneficiarios, 6000))) +
+  tm_fill(col = "GM_2020f", 
+              style = "jenks", 
+              palette= "-RdYlBu",
+              colorNA = NULL,
+              title = "Municipality's degree\nof marginalization in 2020"
+  ) +
+  tm_layout(
+    legend.title.size = 1.2,
+    legend.text.size = .8,
+    legend.width = 1
+  ) +
+  tm_bubbles(size = "sv_final_num_beneficiarios",
+             col = "sv_first_payment_year",
+             palette = "-Greens",
+             title.size = "Number of active SV\nbeneficiaries in 2022"
+             )
+map1
+```
+
+Compare that map against the following in which the municipalities are colored
+based on the IRS
+
+
+```{r}
+map2 <- tm_shape(z %>% mutate(sv_final_num_beneficiarios = pmin(sv_final_num_beneficiarios, 6000))) +
+  tm_fill(col = "irs20_degree", 
+              style = "jenks", 
+              palette= "-RdYlBu",
+              colorNA = NULL,
+              title = "Municipality's degree of\npoverty according to the\nsocial lag index in 2020"
+  ) +
+  tm_layout(
+    legend.title.size = .8,
+    legend.text.size = .5,
+    legend.width = .6,
+    legend.outside = FALSE,
+    legend.position = c("right", "top"),
+    frame = FALSE
+  ) +
+ tm_symbols(size = "sv_final_num_beneficiarios",
+            col = "sv_first_payment_year",
+            shape = 21,
+            n = 3,
+            alpha = 0.75,
+            style = "fixed", breaks = c(2019, 2020, 2021),
+            palette = "-Greens",
+            title.col = "Year of arrival\n of the program",
+            sizes.legend.labels = c("1000", "2000", "4000", "6000 or more"),
+            title.size = "Number of active SV\n beneficiaries in 2022",
+            legend.shape.is.portrait = TRUE,
+            labels = c("2019","2020 and after")
+             ) +
+  tm_shape(state_borders) +
+  tm_borders()
+map2
+
+tmap_save(map2, filename = "paper1/ploP1/recruitment_map_20220918.png", 
+          height = 15,
+          units = "cm")
+```
+
+## Marginalization vs Lag: Comparing the two indexes
+To make a straightfoward comparison the best is to transform the factors 
+into values, and then see for each municipality a heatmap of whether IRS is 
+lower or higher compared to the marginalization level, as follows:
+
+```{r}
+cv <- tribble(~deg, ~numeric,
+              "Very low", 0,
+              "Low", 1,
+              "Medium", 2,
+              "High", 3,
+              "Very high", 4
+              )
+
+t <- z %>%  select(GM_2020f, irs20_degree ) %>% 
+  left_join(cv, by = c("GM_2020f" = "deg")) %>% 
+  left_join(cv, by = c("irs20_degree" = "deg")) %>% 
+  mutate(gm_2_irs = as.factor(numeric.x - numeric.y)) # To plot degree of dissimilarity between
+# both indexes, a negative figure indicates GM is "less critical" than irs
+
+tm_shape(t) +
+  tm_fill(col = "gm_2_irs",
+              palette = "RdYlBu",
+              title = "Marginalization degree minus social lag index"
+              ) +
+  tm_layout(title = "Visualization of difference between GM and IRS",
+            legend.outside = TRUE,
+            attr.outside = TRUE) +
+  tm_credits("Blue indicates marginalization is stronger than\npoverty (social lag) in the municipality")
+```
+With the map above we have a better idea of what might happen once we re-run the 
+analysis swapping GM by IRS, it seems on a first view that "strong" poverty is much more
+localized in certain municipalities, whereas marginalization varies substantially
+across the territory. 
+
+```{r}
+summary(z %>%  select(GM_2020f, irs20_degree ))
+```
+Objectively, there are 790 municipalities in high/very high marginalization 
+situation, whereas only 400 are in those categories for IRS, which made it easier
+to "hit" high marginalization than high poverty. A quick inspection to the map
+suggests that SV was less efficient in addressing poverty than it was in 
+addressing marginalization according to the stats. 
+
+After plotting all those "disconnected" comparatives between the two indexes
+I thought it would be a good idea to put all the info in the same bar graph
+to make it easy to understand and easy to think about the meaning and the 
+bias it generates.
+
+```{r}
+z2 <- z %>% st_drop_geometry() %>% 
+  select(CVEGEO, sv_final_num_beneficiarios, irs20_degree, GM_2020f) %>% 
+  rename(Indice_Rezago_Social_poverty = irs20_degree, Grado_Marginacion_marginalization = GM_2020f) %>% 
+  pivot_longer(cols = 3:4, values_to = "deg", names_to = "metric", values_drop_na = FALSE) %>% 
+  filter(sv_final_num_beneficiarios > 0) %>% 
+  group_by(deg, metric) %>% 
+  summarise(t_benef = sum(sv_final_num_beneficiarios))
+  
+  
+
+bars3 <- ggplot(data = z2) +
+  geom_bar(mapping = aes(x = deg, y = t_benef, fill = metric),
+           position = "dodge",
+           stat = "identity") +
+  scale_color_manual(values = c(rep("black", 6))) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    y = "Number of beneficiaries with SV",
+    x = "Degree of index in which the municipality of the beneficiary lies",
+    fill = "Index applied to classify municipalities with SV",
+    
+  )
+
+bars3
+```
+
+## Breaking down recruitment by the year
+
+It is useful to have percentages of the proportions of beneficiaries in each 
+wave of recruitment
+```{r}
+(s <- z %>% st_drop_geometry() %>% 
+  select(irs20_degree, sv_final_num_beneficiarios, sv_first_payment_year, i20_rural_households) %>% 
+  group_by(sv_first_payment_year) %>% 
+  mutate(total_bene_year = sum(sv_final_num_beneficiarios)) %>% 
+  group_by(irs20_degree) %>% 
+  mutate(total_bene_degree = sum(sv_final_num_beneficiarios, na.rm = TRUE),
+         total_rural_hh = sum(i20_rural_households, na.rm = TRUE)) %>% 
+  group_by(irs20_degree, sv_first_payment_year) %>% 
+  summarise(total_bene_year,
+            total_rural_hh,
+            total_bene_yearNdegree = sum(sv_final_num_beneficiarios),
+            pctg_of_year_rec_in_degree = round(total_bene_yearNdegree*100/total_bene_year, 1),
+            pctg_of_all_degree_in_year = round(total_bene_yearNdegree*100/total_bene_degree, 1),
+            label = str_c(pctg_of_year_rec_in_degree, "%", "\n", pctg_of_all_degree_in_year, "%"),
+            label2 = str_c(round(total_bene_yearNdegree*100/total_rural_hh, 1), "%")
+              ) %>% 
+  ungroup() %>% 
+  unique() %>% 
+  drop_na())
+```
+
+This table is perfect to be made into a bar graph with labels, so that all the
+information that the reader might search for is available
+
+```{r}
+bars4 <- ggplot(data = s, mapping = aes(x = sv_first_payment_year,
+                               y = total_bene_yearNdegree, 
+                               fill = irs20_degree)) +
+  geom_col(position = "dodge") +
+  scale_color_manual(values = c(rep("black", 6))) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    y = "Active SV beneficiaries by 2022",
+    x = "Year of recruitment",
+    fill = "Degree of poverty (social lag) of the municipality"
+  ) +
+  geom_text(
+    aes(label = label),
+    size = 2.5,
+    colour = "black",
+    vjust = 0.5,
+    position = position_dodge(.9)
+    ) 
+bars4 <- afplot(bars4) + theme_classic() + 
+  theme(legend.position = "none",
+        rect = element_rect(fill = "transparent"),
+        plot.background = element_rect(fill = "transparent", color = NA),
+        panel.background = element_rect(fill = "transparent"))
+bars4
+
+ggsave(bars4, 
+       filename = "paper1/ploP1/bar_year_recruitment20220918.png", 
+       bg = "transparent")
+```
+
+The graph above can easily be normalized to show what percentage of the people
+in the different poverty degree municipalities was recruited
+
+```{r}
+bars5 <- ggplot(data = s, mapping = aes(x = sv_first_payment_year,
+                               y = total_bene_yearNdegree/total_rural_hh, 
+                               fill = irs20_degree)) +
+  geom_col(position = "dodge") +
+  scale_color_manual(values = c(rep("black", 6))) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    y = "Percentage of country's rural households\nrecruited on each degree of poverty",
+    x = "Year of recruitment",
+    fill = "Degree of poverty (social lag) of the municipality"
+  ) +
+  geom_text(
+    aes(label = label2),
+    size = 2.5,
+    colour = "black",
+    vjust = -0.3,
+    position = position_dodge(.9)
+    ) 
+bars5 <- afplot(bars5) + theme_classic() + 
+  theme(legend.position = "none",
+        rect = element_rect(fill = "transparent"),
+        plot.background = element_rect(fill = "transparent", color = NA),
+        panel.background = element_rect(fill = "transparent"))
+bars5
+
+ggsave(bars5, 
+       filename = "paper1/ploP1/bar_year_recruitment_norm_20220921.png", 
+       bg = "transparent")
+```
+We can put the two graphs together as Navin suggested 
+
+```{r}
+ d5 <- gridExtra::grid.arrange(bars4, bars5, ncol = 2)
+d5 <- as_ggplot(d5) +                                # transform to a ggplot
+  draw_plot_label(label = c("A", "B"), size = 15,
+                  x = c(0, 0.5), y = c(1, 1)) # Add labels
+ggsave(d5, 
+       filename = "paper1/ploP1/abs_and_norm_rec_20220921.png", 
+       bg = "transparent",
+       height = 5,
+       width = 7,
+       units = "in")
+```
+
+Now we can compare total population and indigenous population and plot 
+the boxes that indicate what is the probability of participating in SV depending
+on the degree of lag and indigenousness of your mun.
+
+```{r}
+s2 <- z %>% st_drop_geometry() %>% 
+  group_by(irs20_degree) %>% 
+  summarise(perc_fam_rec = mean(sv_pfam_rec_0, na.rm = TRUE), # we do not want to use sv_pfam_rec only because it calculates mean and variance only within participating municipalities
+            total_rural_hh = sum(i20_rural_households),
+            pctg_abv5_ind_lang = sum(i20_P5_HLI)/sum(i20_P_5YMAS),
+            total_abv5_ind_lang = sum(i20_P5_HLI)
+            ) %>% drop_na()
+s2
+```
+We can calculate the same boxplot but over all municipalities of the country
+and not only within the SV universe
+
+```{r}
+box2 <- ggplot(data = st_drop_geometry(z) %>% 
+                 filter(!is.na(irs20_degree)), 
+               mapping = aes(x = irs20_degree, y = sv_pfam_rec_0, fill = irs20_degree )) +
+  geom_boxplot(width = 0.5 ) +
+  labs(x = element_blank(),
+       y = "% of families recuited by SV") +
+  scale_y_continuous(labels = scales::label_percent()) +
+  stat_compare_means(method = "anova", label.y = .5) +        # Add global annova p-value
+  stat_compare_means(label = "p.signif", method = "t.test",
+                     ref.group = ".all.", hide.ns = TRUE)      # Pairwise comparison against all
+
+box2 <- afplot(box2) + theme(axis.text.x=element_blank(),
+                         axis.title = element_text(size = 10))
+box2
+```
+
+We can plot the distributions above and leave the box plot as a central message
+
+```{r}
+d1 <- ggplot(data = s2, mapping = aes(x= irs20_degree, fill = irs20_degree)) +
+  geom_col(aes(y = pctg_abv5_ind_lang)) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(
+    y = "Percentage of population\nolder than 5y speaking\nindigenous language in 2020",
+    x = element_blank()
+  ) 
+d1 <- afplot(d1) + theme(axis.text.x=element_blank(),
+                         axis.title = element_text(size = 10))
+
+d2 <- ggplot(data = s2, mapping = aes(x= irs20_degree, fill = irs20_degree)) +
+  geom_col(aes(y = total_rural_hh)) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    y = "Rural households in 2020",
+    x = element_blank()
+  )
+d2 <- afplot(d2) + theme(axis.text.x=element_blank(),
+                         axis.title = element_text(size = 10))
+
+# for this graph it is key to highlight that this is relative only to 
+# municipalities participating in the program, the filtering happens
+# when you set y = sv_pfam_rec that leaves out all NA mun
+box1 <- ggplot(data = st_drop_geometry(z) %>% 
+                 filter(!is.na(irs20_degree)), na.rm = TRUE, 
+               mapping = aes(x = irs20_degree, y = sv_pfam_rec, fill = irs20_degree )) +
+  geom_boxplot(width = 0.5 ) +
+  labs(x = element_blank(),
+       y = "% of families recuited by SV\nin participating municipalities") +
+  scale_y_continuous(labels = scales::label_percent()) +
+  stat_compare_means(method = "anova", label.y = .5) +        # Add global annova p-value
+  stat_compare_means(label = "p.signif", method = "t.test",
+                     ref.group = ".all.", hide.ns = TRUE)      # Pairwise comparison against all
+
+box1 <- afplot(box1) + theme(axis.text.x=element_blank(),
+                         axis.title = element_text(size = 10))
+
+# For the 3 graph box I included box2 
+d4 <- gridExtra::grid.arrange(box2,
+                        gridExtra::arrangeGrob(d2, d1, ncol = 2),
+                        nrow = 2)
+d4 <- gridExtra::arrangeGrob(box2,                               # box plot spaning two columns
+             d2, d1,                               # bar plots
+             ncol = 2, nrow = 2, 
+             layout_matrix = rbind(c(1,1), c(2,3)))
+
+d4 <- as_ggplot(d4) +                                # transform to a ggplot
+  draw_plot_label(label = c("A", "B", "C"), size = 15,
+                  x = c(0, 0, 0.5), y = c(1, 0.5, 0.5)) # Add labels
+
+ggsave(d4, 
+       filename = "paper1/ploP1/prob_rec_20220921.png", 
+       bg = "transparent")
+
+```
+
+#### Swapping GM for IRS
+
+I'm going to start replicating the data analysis for the poster in the following
+graphs, but this time for IRS instead of GM
+
+```{r}
+bars1 <- ggplot(z %>% filter(!is.na(irs20_degree)), aes(y = sv_final_num_beneficiarios, x = sv_first_payment_year, fill = irs20_degree)) +
+  stat_summary(fun = sum, geom = "col", colour = "black", position = "dodge") +
+  scale_color_manual(values = c(rep("black", 6))) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    y = "Active SV beneficiaries by 2022",
+    x = "Year of recruitment",
+    fill = "Degree of poverty (social lag) of the municipality"
+  ) 
+bars1 <- afplot(bars1)
+bars1
+```
+
+In terms of addressing poverty by municipality clearly SV did not go well. It 
+seems like it replicates the same pattern it has long criticized of staying away
+from the poorest.
+It is contrary to what was prioritized in the rules of operation. We can also look
+at the number of municipalities in each category to which the program was offered
+
+```{r}
+bars2 <- ggplot(z %>% filter(!is.na(irs20_degree)), aes(y = sv_participates, x = irs20_degree, fill = irs20_degree)) +
+  stat_summary(fun = sum, geom = "col", colour = "black") +
+  scale_color_manual(values = c(rep("black", 6))) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    y = "Number of municipalities with SV",
+    x = "Degree of poverty (social lag) of the municipality"
+  )
+bars2 <- afplot(bars2)
+bars2
+```
+The following box plot has the great disadvantage of reducing the universe to 
+municipalities with sembrando vida only, therefore generating a deformated 
+idea that the program reached 10% of the pepole while the recruitment had a 
+preselection that kicked out many people arbitrarily
+
+```{r}
+box1 <- ggplot(data = z %>% filter(!is.na(irs20_degree)), na.rm = TRUE, mapping = aes(x = irs20_degree, y = sv_pfam_rec, fill = irs20_degree )) +
+  geom_boxplot(width = 0.5 ) +
+  labs(x = "Municipal degree of poverty",
+       y = "Share of resident families recuited by SV") +
+  scale_y_continuous(labels = scales::label_percent()) +
+  stat_compare_means(method = "anova", label.y = .5) +        # Add global annova p-value
+  stat_compare_means(label = "p.signif", method = "t.test",
+                     ref.group = ".all.", hide.ns = TRUE)      # Pairwise comparison against all
+
+
+box1 <- afplot(box1)
+box1
+```
+
+In terms of proportion of families recruited, it makes sense to see that level
+of poverty is proportional. However, it might also be important to see absolute
+numbers of municipalities in each category.
+
+```{r}
+points0 <- ggplot(data = z %>% filter(!is.na(irs20_degree)), na.rm = TRUE,
+                  mapping = aes(x = irs20_degree,
+                                y = sv_pfam_rec,
+                                fill = irs20_degree )) +
+  geom_point() +
+  labs(x = "Municipal degree of poverty",
+       y = "Share of resident families recuited by SV")
+points0
+```
+
+
+```{r}
+points1 <- ggplot(data = z %>% filter(!is.na(irs20_degree), sv_final_num_beneficiarios > 0), 
+                  aes(x = sv_pfam_rec, y = sv_area_trans_perc)) + 
+  geom_point(aes(x = sv_pfam_rec, y = sv_area_trans_perc), fill = "black", size = 2) +
+  geom_point(aes(colour = irs20_degree )) +
+  annotate(geom = "text", x = .45, y = .30, label = "41% of the fams and \n 23% of the mun area impacted", color = "#abd9e9") + 
+  geom_segment(aes(x = .415, y = .235, xend = .42, yend = .27), color = "#abd9e9") +
+  scale_color_brewer(palette = pal, direction = -1) +
+  labs(title = "Visualization of degree of participation of municipalites (points) \n in SV as a function of the share of families \n and area impacted by SV ", 
+       x = "Share of families recruited by SV",
+       y = "Share of municipal area under SV",
+       colour = "Degree of marginalization") +
+    scale_x_continuous(labels = scales::label_percent()) +
+    scale_y_continuous(labels = scales::label_percent())
+  
+
+points1 <- afplot(points1)
+points1
+```
+
+My general impression from this graph is that the municipalities with high impact
+in terms of proportion of families tend to have more poor municipalities (red dots) 
+that that big cloud of not-strongly impacted blue dots next to the origin.
+
+I have not tried mapping a nice distribution of the number of beneficiaries to 
+visualize the role of small and large populations of beneficiaries. The distribution
+is lognormal
+
+```{r}
+ggplot(z, aes(x = log( sv_final_num_beneficiarios))) +
+  geom_histogram(binwidth = .2) +
+  geom_freqpoly()
+  
+```
+
+
+## The dimension of addressing deforestation.
+
+First, we want to visualize absolute and relative deforestation, each of which we 
+will present in a simple map.
+
+```{r}
+mapbr(var_string = "gfw_avg_loss_01to21", 
+       title_string = "Average absolute annual loss in 2001 - 2021", 
+       dataset = z, 
+       breaks_vec = c(0, 200, 500, 1000, 2000, 4000, 9000) )
+```
+
+```{r}
+mapbr(var_string = "gfw_avg_norm_loss_01to21", 
+       title_string = "Average of annual normalized loss in 2001 - 2021", 
+       dataset = z, 
+       breaks_vec = c(0, 0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 1))
+```
+Did SV end up in the areas with the most forest?
+
+```{r}
+ggplot(data = z %>% filter(gfw_pondTreeCover > 0) ) +
+  geom_point(mapping = aes(y = sv_final_num_beneficiarios_0, x = gfw_pondTreeCover), colour = "#278b2c") +
+  geom_smooth(mapping = aes(y = sv_final_num_beneficiarios_0, x = gfw_pondTreeCover), method = "lm", color = rlcol, linetype = "dashed") +
+  labs(x = "Forest cover in 2001, Hansen et al. (2013)",
+       y = "Number of families recruited by SV") +
+  ggpubr::stat_regline_equation(label.y.npc = .7, label.x.npc = .7, aes(y = sv_final_num_beneficiarios_0, x = gfw_pondTreeCover, label = ..eq.label..), color = rlcol) +
+  ggpubr::stat_regline_equation(label.y.npc = .8 , label.x.npc = .7, aes(y = sv_final_num_beneficiarios_0, x = gfw_pondTreeCover, label = ..rr.label..), color = rlcol) +
+  ggpubr::stat_cor(label.y.npc = .6 , label.x.npc = .7, method= "pearson", aes(y = sv_final_num_beneficiarios_0, x = gfw_pondTreeCover), color = rlcol)
+
+ggsave(filename = "paper1/ploP1/forestCoverSVrec.png",
+       width = 10,
+       height = 7,
+       units = "in")
+```
+
+The only conclusive graph I have for this section is the regression of 
+number of beneficiaries against forest loss per year, which might be 
+the plot to show.
+
+```{r}
+forest_a_nonorm <- ggplot(data = z %>% filter(gfw_avg_loss_01to18 > 0)) +
+  geom_point(mapping = aes(y = sv_final_num_beneficiarios_0, x = gfw_avg_loss_01to18, alpha = gfw_pondTreeCover, size = gfw_pondTreeCover) , color = "#278b2c") +
+  guides(alpha = guide_legend(title = "Woody cover in 2001"), size = guide_legend(title = "Woody cover in 2001")) +
+  # geom_point(data = z %>% arrange(desc(gfw_avg_loss_01to18)) %>% slice_head(n = 10), mapping = aes(y = sv_final_num_beneficiarios_0, x = gfw_avg_loss_01to18, size = gfw_pondTreeCover), colour = "black") +
+  geom_smooth(mapping = aes(y = sv_final_num_beneficiarios_0, x = gfw_avg_loss_01to18), method = "lm", color = rlcol, linetype = "dashed" ) +
+  labs(x = "Woody cover loss per year (hectares) \n in 2001-2018 by municipality, Hansen et al. (2013)",
+       y = "Number of families recruited by SV",
+       colour = "Degree of marginalization") +
+ # ggrepel::geom_text_repel(data = z %>% arrange(desc(gfw_avg_loss_01to18)) %>% slice_head(n = 10), mapping = aes(y = sv_final_num_beneficiarios_0, x = gfw_avg_loss_01to18, label = CVEGEO, size = 10)) +
+  scale_x_continuous(labels = scales::label_number()) +
+  scale_y_continuous(labels = scales::label_number()) +
+  ggpubr::stat_regline_equation(label.y = 12000, label.x = 5000, aes(y = sv_final_num_beneficiarios, x = gfw_avg_loss_01to18, label = ..eq.label..)) +
+  ggpubr::stat_regline_equation(label.y = 11000 , label.x = 5000, aes(y = sv_final_num_beneficiarios, x = gfw_avg_loss_01to18, label = ..rr.label..)) +
+  ggpubr::stat_cor(label.y = 10000 , label.x = 5000, method = "pearson", aes(y = sv_final_num_beneficiarios, x = gfw_avg_loss_01to18)) + 
+  theme_light() +
+    theme(legend.key.size = unit(18, "pt")) +
+    scale_fill_brewer(palette = pal, direction = -1) + 
+    theme(axis.title = element_text(size = 14),
+          axis.text = element_text(size = 14),
+          plot.title = element_text(size = 18)
+    ) 
+
+ggsave(filename = "paper1/ploP1/fl.png",
+       plot = forest_a_nonorm,
+       width = 10,
+       height = 7,
+       units = "in")
+forest_a_nonorm
+```
+
+We can also normalize the forest loss and not the allocation of beneficiaries, or 
+the converse, to 
+see if we can see some trend in terms of addressing the urgency of losing the 
+little forest there's left
+
+```{r}
+forest_b_nonorm <- ggplot(data = z %>% filter(gfw_avg_loss_01to18 > 0) ) +
+  geom_point(mapping = aes(y = sv_pfam_rec_0, x = gfw_avg_loss_01to18 , color = irs20_degree )) +
+  geom_smooth(mapping = aes(y = sv_pfam_rec_0, x = gfw_avg_loss_01to18), method = "lm", color = rlcol, linetype = "dashed" ) +
+  labs(x = "Forest loss per year (hectares)\n in 2001-2018 by municipality, Hansen et al. (2013)",
+       y = "% of families recruited by SV",
+       colour = "Degree of poverty") +
+  scale_y_continuous(labels = scales::label_number()) #+
+  # ggpubr::stat_regline_equation(label.y = 12000, label.x = 5000, aes(y = sv_final_num_beneficiarios, x = gfw_avg_loss_01to18, label = ..eq.label..)) +
+  # ggpubr::stat_regline_equation(label.y = 11000 , label.x = 5000, aes(y = sv_final_num_beneficiarios, x = gfw_avg_loss_01to18, label = ..rr.label..)) +
+  # ggpubr::stat_cor(label.y = 10000 , label.x = 5000, method = "pearson", aes(y = sv_final_num_beneficiarios, x = gfw_avg_loss_01to18))
+
+
+(forest_b_nonorm)
+
+ggsave(filename = "paper1/ploP1/flnorm3.png",
+       plot = forest_b_nonorm,
+       width = 6.5,
+       height = 4,
+       units = "in")
+```
+Now that I have a new calculation of the normalized annual loss would like
+to see how it looks in a regression
+
+```{r}
+forest_b_norm <- ggplot(data = z %>% filter(gfw_avg_norm_loss_01to18 > 0) ) +
+  geom_point(mapping = aes(y = sv_final_num_beneficiarios, x = gfw_avg_norm_loss_01to18 , color = irs20_degree )) +
+  geom_smooth(mapping = aes(y = sv_final_num_beneficiarios, x = gfw_avg_norm_loss_01to18), method = "lm", color = rlcol, linetype = "dashed" ) +
+  labs(x = "Average yearly forest cover loss rate 2001-2018 by municipality, Hansen et al. (2013)",
+       y = "Number of families recruited by SV",
+       colour = "Degree of poverty") +
+ ggpubr::stat_regline_equation(label.y.npc = .9, label.x.npc = .8, aes(y = sv_final_num_beneficiarios, x = gfw_avg_norm_loss_01to18, label = ..eq.label..)) +
+ ggpubr::stat_regline_equation(label.y.npc = .8 , label.x.npc = .8, aes(y = sv_final_num_beneficiarios, x = gfw_avg_norm_loss_01to18, label = ..rr.label..)) +
+  coord_cartesian(xlim = c(0, .05))
+
+
+(forest_b_norm)
+
+ggsave(filename = "paper1/ploP1/flnorm4.png",
+       plot = forest_b_norm,
+       width = 6.5,
+       height = 4,
+       units = "in")
+```
+
+The following graph finds a very weak relationship so it was used only to show
+that normalization weakens and entangles the evidence during the committee meeting
+
+```{r}
+scol <- "#636363"
+
+forest_p <- ggplot(data = z %>% filter(gfw_avg_norm_loss_01to18 > 0, gfw_avg_norm_loss_01to18 < .06)) +
+  geom_point(mapping = aes(x = gfw_avg_norm_loss_01to18, y = sv_pfam_rec_0, size = gfw_pondTreeCover), colour = gr) +
+  #geom_point(data = z %>% arrange(desc(gfw_avg_loss_01to18)) %>% slice_head(n = 10), mapping = aes(x = gfw_avg_norm_loss_01to18, y = sv_pfam_rec_0, size = area21), colour = "black") +
+  #geom_smooth(mapping = aes(x = gfw_avg_norm_loss_01to18, y = sv_pfam_rec_0), method = "lm", color = scol, linetype = "dashed" ) +
+  geom_smooth(mapping = aes(x = gfw_avg_norm_loss_01to18, y = sv_pfam_rec)) +
+  labs( x = "Average annual rate of woody cover loss\nin 2001-2018 by municipality, Hansen et al. (2013)",
+        y = "% of families living in\nthe municipality recruited by SV") +
+  #ggrepel::geom_text_repel(data = z %>% arrange(desc(gfw_avg_loss_01to18)) %>% slice_head(n = 10), mapping = aes(x = gfw_avg_norm_loss_01to18, y = sv_pfam_rec_0, label = CVEGEO, size = .2)) +
+  scale_x_continuous(labels = scales::label_percent()) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  ggpubr::stat_regline_equation(label.y.npc = .7, label.x.npc = .7, aes(x = gfw_avg_norm_loss_01to18, y = sv_pfam_rec, label = ..eq.label..), color = scol) +
+  ggpubr::stat_regline_equation(label.y.npc = .8 , label.x.npc = .7, aes(x = gfw_avg_norm_loss_01to18, y = sv_pfam_rec, label = ..rr.label..), color = scol) +
+  ggpubr::stat_cor(label.y.npc = .6 , label.x.npc = .7, method= "pearson", aes(x = gfw_avg_norm_loss_01to18, y = sv_pfam_rec), color = scol) +
+  labs(size = "Hectares of woody\ncover in 2001")  + 
+  theme_light() +
+    theme(legend.key.size = unit(18, "pt")) +
+    scale_fill_brewer(palette = pal, direction = -1) + 
+    theme(axis.title = element_text(size = 14),
+          axis.text = element_text(size = 14),
+          plot.title = element_text(size = 18)
+    ) 
+
+ggsave(filename = "paper1/ploP1/fln.png",
+       plot = forest_p,
+       width = 10,
+       height = 7,
+       units = "in")
+forest_p
+```
+
+Trends of permanent deforestation are shown in the following figure based on the 
+probability of forest loss to be not regained using the quotient from the years
+2001 to 2012
+
+THIS IS WRONG, WE CHANGED THE ESTIMATOR, SO NOW INSTEAD RECONFIGURE THE VARIABLE
+total forest lost in 01-12 TO BE CALCULATED AS yearly rate * years
+```{r}
+forest_loss_perm <- ggplot(data = z %>% filter(gfw_prop_loss_perm_01to12 > -1)) +
+  geom_point(mapping = aes(x = gfw_prop_loss_perm_01to12 , y = sv_pfam_rec), colour = gr) +
+  geom_smooth(mapping = aes(x = gfw_prop_loss_perm_01to12, y = sv_pfam_rec), method = "lm", color = rlcol, linetype = "dashed" ) +
+  labs( x = "Probability of forest loss\nbeing permanent based on\n01-12 Hansen et al. (2013)",
+       y = "% of families recruited by SV",
+       colour = "Degree of marginalization") +
+  scale_x_continuous(labels = scales::label_percent()) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  ggpubr::stat_regline_equation(label.y = .7, label.x = -.7, aes(x = gfw_prop_loss_perm_01to12 , y = sv_pfam_rec, label = ..eq.label..)) +
+  ggpubr::stat_regline_equation(label.y = .8 , label.x = -.7, aes(x = gfw_prop_loss_perm_01to12 , y = sv_pfam_rec, label = ..rr.label..)) +
+  ggpubr::stat_cor(label.y = .6 , label.x = -.7, method= "pearson", aes(x = gfw_prop_loss_perm_01to12 , y = sv_pfam_rec))
+
+
+forest_loss_perm <- afplot(forest_loss_perm)
+forest_loss_perm
+```
+
+## The dimension of priorities for biodiversity.
+
+First graph that's the most natural is to look at the restoration
+priority areas and directly assess if the program directed efforts to there
+
+```{r}
+rest_p <- ggplot(data = z ) +
+  geom_point(mapping = aes(x = rpi_prop / 3, y = sv_final_num_beneficiarios), colour = "#7d793c") +
+  geom_smooth(mapping = aes(x = rpi_prop / 3, y = sv_final_num_beneficiarios), method = "lm", color = rlcol, linetype = "dashed" ) +
+  # annotate(geom = "text", x = .45, y = .30, label = "41% of the fams and \n 23% of the mun area impacted", color = "#abd9e9") + 
+  # geom_segment(aes(x = .415, y = .235, xend = .42, yend = .27), color = "#abd9e9") +
+  # scale_color_brewer(palette = pal, direction = -1) +
+  labs( x = "Restoration priority index",
+       y = "Number families recruited by SV",
+       colour = "Degree of marginalization") +
+  scale_x_continuous(labels = scales::label_number()) +
+  scale_y_continuous(labels = scales::label_number())+
+  ggpubr::stat_regline_equation(label.y = 10000, label.x = .7, aes(x = rpi_prop / 3, y = sv_pfam_rec, label = ..eq.label..)) +
+  ggpubr::stat_regline_equation(label.y = 11000 , label.x = .7, aes(x = rpi_prop / 3, y = sv_pfam_rec, label = ..rr.label..)) +
+  ggpubr::stat_cor(label.y = 12000 , label.x = .7, method = "pearson", aes(x = rpi_prop / 3, y = sv_pfam_rec))
+
+
+rest_p <- afplot(rest_p)
+rest_p
+
+ggsave(filename = file.path(path, "restprop.png"),
+       plot = rest_p,
+       width = 7.7,
+       height = 6,
+       units = "in")
+```
+
+
+Then we look at areas for conservation priority
+
+```{r}
+cons_p <- ggplot(data = z) +
+  geom_point(mapping = aes(x = kpi_prop / 3, y = sv_final_num_beneficiarios), colour = "#75a60c") +
+  geom_smooth(mapping = aes(x = kpi_prop / 3, y = sv_final_num_beneficiarios), method = "lm", color = rlcol, linetype = "dashed" ) +
+  # annotate(geom = "text", x = .45, y = .30, label = "41% of the fams and \n 23% of the mun area impacted", color = "#abd9e9") + 
+  # geom_segment(aes(x = .415, y = .235, xend = .42, yend = .27), color = "#abd9e9") +
+  # scale_color_brewer(palette = pal, direction = -1) +
+  labs(x = "Biodiversity conservation priority index",
+       y = "Number of families recruited by SV",
+       colour = "Degree of marginalization") +
+  scale_x_continuous(labels = scales::label_number()) +
+  scale_y_continuous(labels = scales::label_number()) +
+  ggpubr::stat_regline_equation(label.y = 10000, label.x = .7, aes(x = kpi_prop / 3, y = sv_final_num_beneficiarios, label = ..eq.label..)) +
+  ggpubr::stat_regline_equation(label.y = 11000 , label.x = .7, aes(x = kpi_prop / 3, y = sv_final_num_beneficiarios, label = ..rr.label..)) +
+  ggpubr::stat_cor(label.y = 12000 , label.x =.6 , method = "pearson", aes(x = kpi_prop / 3, y = sv_final_num_beneficiarios))
+
+
+cons_p <- afplot(cons_p)
+
+ggsave(filename = file.path(path, "cons.png"),
+       plot = cons_p,
+       width = 7.7,
+       height = 6,
+       units = "in")
+```
+
+
+## Additional attempts to build other visualizations
+
+Trying to get all the variables 
+
+```{r eval=FALSE, include=FALSE}
+library(GGally)
+z4 <- st_drop_geometry(z) %>% 
+  select(irs_20_index, sv_pfam_rec_0, sv_final_num_beneficiarios_0, gfw_avg_loss_16to18, gfw_prop_loss_perm_01to12) %>% 
+  drop_na() %>% 
+  slice_sample(n = 50)
+
+z4 %>% 
+  ggparcoord(columns = 1:5, 
+             groupColumn = 1, 
+             showPoints = TRUE,
+             scale = "std")
+  
+```
+
+The main challenge now, is to break down the graph of forest and restoration priority
+into classes and then see if those classes have something to explain about each
+other: to be tried 
+
+- split municipalities in a 3x3 arrange of Rest priority (h,m,l) and Cons priority
+and see how deforestation behaves on those quadrants
+- you can think of Rest and Cons priorities as the predictor to see if deforestation
+was going to occurr
+
+- see where the resources were allocated, with different metrics
+
+Why not some test/play graphs?
+
+What are the municipalities that have the most importance for restoration and 
+conservation in absolute numbers? Split them into categories (had to do this
+in previous script to create kpi and rpi tertiles)
+
+```{r}
+fc1 <- ggplot(data = z %>% filter(sv_participates = TRUE, !is.na(kpi_prop_tertile), !is.na(rpi_prop_tertile), !CVEGEO == "07059"),
+              aes(x = sv_area_trans_abs, y = gfw_sv_0118_period_delta)) +
+  geom_point(mapping = aes(color = gfw_prop_loss_perm_01to12)) +
+  geom_text(aes(label = NOM_MUN), alpha = 0.2, size = 3) +
+  facet_grid(rows = vars(kpi_prop_tertile), cols = vars(rpi_prop_tertile), labeller = label_both)
+fc1 <- afplot(fc1)
+fc1
+```
+
+We can try the same graph but comparing deforestation rates from the 3 years
+previous to SV against the following 3 years. Can we see a statistically significant
+difference between the deforestation trends: 3 yrs prior VS 3 yrs post
+
+```{r}
+fc2 <- ggplot(data = z %>% filter(sv_participates = TRUE, !is.na(kpi_prop_tertile), !is.na(rpi_prop_tertile)),
+              aes(x = sv_area_trans_abs, y = gfw_sv_1618_period_delta)) +
+  geom_point(mapping = aes(color = irs20_degree)) +
+  geom_text(aes(label = NOM_MUN), alpha = 0.2, size = 3) +
+  facet_grid(rows = vars(kpi_prop_tertile), cols = vars(rpi_prop_tertile), labeller = label_both)
+fc2 <- afplot(fc1)
+fc2
+```
+I want to turn those graphs above into boxplots instead of points plots and see 
+if I can see something with the breakdown, I should take jeanine's idea and remake
+it here for num of beneficiaries
+
+```{r}
+
+```
+
+I will normalize all the forest loss figures in the following graphs, and that is
+going to be a drastic change, thus I am saving this script as a new version. The 
+following chunck already uses normalized graphs, for non_normalized tweak the 
+_select_ line by removing the negation of second term
+
+```{r}
+z3 <- z  %>%
+  select(contains(c("CVE", "norm")) & !contains("_norm_")) %>% 
+  pivot_longer(cols = 4:24, values_to = "loss_ha", names_to = "loss_year") %>% 
+  mutate(loss_year = str_sub(loss_year, start = 13, end = 16) %>% as.numeric) 
+```
+
+We can visualize what the linear model analysis we want to generalize looks like
+by plotting all the slopes and identifying those that are outliers
+
+```{r}
+ggplot(data = z3 %>% filter(sv_participates = TRUE)) +
+  geom_smooth(data = z3 %>% filter(loss_year > 2018), 
+              aes(x = loss_year, y = loss_ha, group = CVEGEO),
+              method = "lm",
+              se = FALSE) +
+  geom_smooth(data = z3 %>% filter(loss_year >= 2017, loss_year <= 2019), 
+              aes(x = loss_year, y = loss_ha, group = CVEGEO),
+              color = "red",
+              method = "lm",
+              se = FALSE)
+```
+- Observation with non-normalized data:
+Well, at least the slopes after SV seem to be slightly less spiky. Now we can
+extract the values of those slopes and make a comparison among them on whether 
+they inverted or varied substantially from one year to another
+- Observation with normalized data:
+For 2017 - 2019 I can spot three dominant decreasing trends and four dominant increasing trends 
+For 2019 - 2021 I can spot two dominant increasing trends and 5 perceptible increasing
+trends, while at least 11 decreasing trends can be seen with clarity
+
+```{r}
+
+# First of all, test process for 1 municipality
+st_drop_geometry(z3) %>% 
+  filter(CVEGEO == '07059', loss_year > 2018) %>% 
+  lm(loss_ha ~ loss_year, data = .) %>% lm.beta()
+  
+st_drop_geometry(z3) %>% 
+  filter(CVEGEO == '07059', loss_year > 2015, loss_year < 2019) %>% 
+  lm(loss_ha ~ loss_year, data = .) %>% lm.beta()
+
+ggplot(data = st_drop_geometry(z3) %>% filter(CVEGEO == '07059'),
+       aes(x = loss_year, y = loss_ha)) +
+  geom_line() +
+  geom_smooth(data = . %>% filter(loss_year > 2018), 
+              method = "lm",
+              se = FALSE) +
+  geom_smooth(data = . %>% filter(loss_year > 2015, loss_year < 2019), 
+              method = "lm",
+              se = FALSE,
+              color = "orange") +
+  ggpubr::stat_regline_equation(data = . %>% filter(loss_year > 2018), label.y.npc = .8 ,
+                                label.x.npc = .1,
+                                aes(x = loss_year, y = loss_ha, label = ..eq.label..),  
+                                color = "blue") +
+  ggpubr::stat_regline_equation(data = . %>% filter(loss_year > 2015, loss_year < 2019), 
+                                label.y.npc = .7 ,
+                                label.x.npc = .1,
+                                aes(x = loss_year, y = loss_ha, label = ..eq.label..),  
+                                color = "orange") 
+
+```
+
+```{r}
+# The following code applies a linear model to each municipality during the
+# three years SV has been in place and reports the slope of the trend of
+# deforestation
+
+m_during_sv <- st_drop_geometry(z3) %>% # No need of geometry
+  as_tibble() %>% 
+  drop_na() %>% # remove all NA columns because they cause a an error that is hard to identify
+  select(CVEGEO, loss_year, loss_ha) %>% # only keep columns necessary for regression
+  filter(loss_year >= 2019) %>% # keep years needed for regression as will apply to all 
+  group_by(CVEGEO) %>% # when applying lm we want to keep years for the same municipality together
+  group_modify(
+    ~ broom::tidy(lm( loss_ha ~ loss_year, data = .x) %>% lm.beta()) # apply a standardized lm through lm.beta that is equivalent to applying scale() or substracting mean and dividing by sd to the terms of the formula in the regression 
+  ) %>% 
+  ungroup() %>% 
+  filter(term == 'loss_year') %>% # we are not interested in the intersections, we keep only coefficients that represent the slope of the regression line for the values of the years we chose
+  rename_with(.cols = !contains("CVE"), .fn = ~str_c(., "_while_sv")) # append a prefix for naming all columns
+
+m_pre_sv <- st_drop_geometry(z3) %>%
+  as_tibble() %>% 
+  drop_na() %>% 
+  select(CVEGEO, loss_year, loss_ha) %>% 
+  filter(loss_year >= 2016, loss_year <= 2018) %>% 
+  group_by(CVEGEO) %>%
+  group_modify(
+    ~ broom::tidy(lm( loss_ha ~ loss_year, data = .x) %>% lm.beta())
+  ) %>% 
+  ungroup() %>% 
+  filter(term == 'loss_year') %>% 
+  rename_with(.cols = !contains("CVE"), .fn = ~str_c(., "_pre_sv"))
+
+lm_sv <- m_during_sv %>% 
+  left_join(m_pre_sv, by = "CVEGEO") %>% 
+  select(- contains("term")) %>% 
+  mutate(while_sv_angle_loss = atan(std_estimate_while_sv) * 180/pi ,
+         pre_sv_angle_loss = atan(std_estimate_while_sv)*180/pi,
+         )
+```
+
+Probably generalizing the model and applying it to all years
+we have available can give us a better idea of how it would work
+
+```{r}
+slopy <- function(data = z3, start_y = 2001, end_y = 2021){
+  st_drop_geometry(data) %>%
+  as_tibble() %>% 
+  drop_na() %>% 
+  select(CVEGEO, loss_year, loss_ha) %>% 
+  filter(loss_year >= start_y, loss_year <= end_y) %>% 
+  group_by(CVEGEO) %>%
+  group_modify(
+    ~ broom::tidy(lm( loss_ha ~ loss_year, data = .) %>% lm.beta())
+  ) %>% 
+  ungroup() %>% 
+  filter(term == 'loss_year') %>% 
+  mutate(angle = atan(std_estimate) * 180 / pi, .before = 3) %>% 
+  rename_with(.cols = !contains("CVE"),
+              .fn = ~ str_c("slp_", str_sub(start_y, 3, 4), "_", str_sub(end_y, 3, 4), "_", .))
+}
+```
+
+Now that we have a generalized function, we can think of the model we want
+to build, so I am describing it below: 
+We can use as threshold the avg trend of deforestation countrywide. If 
+you are deforesting faster than that, you need to address that quickly. 
+That gives us two categories for forest cover loss on each calculation, 
+- the "slow def"
+- the "fast def"
+we can also group all the recoveries (that are all positive slopes of the
+regression line) in one and have
+- "in recovery" 
+I think we can use the long term and short term def trends to analyze what
+is happening, so we can calculate what happened in the last 20 years and 
+what happened in the last 3. There are some interesting combinations that we
+can use to classify the forest cover loss trends:
+CATEGORY | LONG TERM TREND | SHORT TERM TREND
+- Reverting def | deforesting | recovering
+- Recent def | recovering or stable | deforesting
+- Steady def | deforesting | deforesting
+I will have to set thresholds but can do that based on the profile of angle
+values that we can see in the density
+
+```{r}
+ggplot(slopy()) + geom_histogram(aes(x = slp_01_21_angle, y = ..density..), binwidth = 1) + geom_density(aes(x = slp_01_21_angle))
+```
+
+The density looks like a camel with humps at -10, 10 so I will do x < 10 as 
+a stable def and any negative values as in recovery, anything above 10 will be 
+considered to be losing cover fast. Wondering what the avg is for Mx? look at the
+avg angle 
+
+```{r}
+summary(slopy())
+```
+
+So we proceed to get short and long term deforestation trends and use that to 
+build a classification and then to map which municipalities got SV based on their
+deforestation trends
+
+```{r}
+lm_loss_pre_sv <- slopy(start_y = 2001, end_y = 2018) %>% 
+  left_join(slopy(start_y = 2016, end_y = 2018), by = "CVEGEO") %>% 
+  left_join(slopy(start_y = 2019, end_y = 2021), by = "CVEGEO") %>%
+  left_join(z %>% select(CVEGEO,
+                         gfw_avg_loss_01to18,
+                         gfw_avg_loss_16to18,
+                         gfw_avg_loss_19to21,
+                         sv_final_num_beneficiarios_0,
+                         sv_participates,
+                         sv_pfam_rec_0,
+                         sv_area_trans_perc,
+                         sv_first_payment_year,
+                         geometry),
+            by = "CVEGEO") %>% 
+  select(CVEGEO, contains(c("angle", "gfw", "sv")), geometry) %>% 
+  mutate(
+    slp_16_18_angle_no_0 = replace_na(slp_16_18_angle, -89),
+    slp_19_21_angle_no_0 = replace_na(slp_19_21_angle, -89)
+  ) %>% # Applying replace_na because we do not have columns with NA, they are al NaN derived from calculating atan(0) you can verify with lm_loss_pre_sv %>% filter(is.na(slp_16_18_angle)) %>% summary()
+  st_as_sf() %>%
+  mutate(
+    sv_arrival_inverted_trend = (slp_16_18_angle * slp_19_21_angle) / abs(slp_16_18_angle * slp_19_21_angle), # -1 if trend inverted (changed sign) from 1618 to 1921 
+    angle_dif = slp_16_18_angle - slp_19_21_angle, # a + number indicates sv had positive effect because positive numbers derive from trend 1921 being smaller than 1618
+    inversion_favors_sv = case_when(
+      sv_arrival_inverted_trend == -1 & slp_16_18_angle > 0 ~ 1, # means the shift favors SV
+      sv_arrival_inverted_trend %in% c(1, NaN) ~ 0, # no shift detected
+      sv_arrival_inverted_trend == -1 & slp_16_18_angle < 0 ~ -1 # sv had inverse desired effect
+    ) 
+  ) 
+```
+
+```{r}
+mapbnl(var_string = "slp_01_18_angle", title_string = "Cover loss in 01-18", dataset = lm_loss_pre_sv, style_string = "pretty")
+```
+
+
+```{r}
+mapbnl(var_string = "slp_16_18_angle", title_string = "Cover loss in 16-18", dataset = lm_loss_pre_sv, style_string = "pretty")
+```
+```{r}
+mapbnl(var_string = "slp_19_21_angle", title_string = "Cover loss in 19-21", dataset = lm_loss_pre_sv, style_string = "pretty")
+```
+
+Now it's time to classify the cover loss trend by the criteria we mentioned 
+above and then build a typology of the SV recruitment based on that
+
+```{r}
+classifier <- lm_loss_pre_sv %>% 
+  mutate(
+    ltt = case_when(
+    slp_01_18_angle > 10 ~ "fast",
+    slp_01_18_angle > 0 & slp_01_18_angle <= 10 ~ "slow",
+    TRUE ~ "recovering"),
+    stt = case_when(
+    slp_16_18_angle > 10 ~ "fast",
+    slp_16_18_angle > 0 & slp_01_18_angle <= 10 ~ "slow",
+    TRUE ~ "recovering"),
+    gen_trend = case_when(
+    ltt == "fast" & stt == "fast" & (gfw_avg_loss_16to18 > gfw_avg_loss_01to18) ~ "Critical Concern",
+    ltt == "recovering" & stt == "recovering" & (gfw_avg_loss_16to18 < gfw_avg_loss_01to18) ~ "Steady Recovery",
+    ltt == "recovering" & stt != "recovering" & (gfw_avg_loss_16to18 > gfw_avg_loss_01to18) ~ "Arrested Recovery",
+    ltt == "slow" & stt == "fast" ~ "Accelerated Loss",
+    ltt == "fast" & stt == "slow" & (gfw_avg_loss_16to18 < gfw_avg_loss_01to18) ~ "De-accelerated Loss",
+    !ltt == "recovering" & stt == "recovering" ~ "Beginning Recovery",
+    TRUE ~ NA_character_
+    ),
+    gen_trend = factor(gen_trend,
+                               levels = (c("Steady Recovery",
+                                           "Beginning Recovery",
+                                           "Arrested Recovery",
+                                           "De-accelerated Loss",
+                                           "Accelerated Loss",
+                                           "Critical Concern")),
+                       labels = (c("01-18 Down, 16-18 Down & smaller avg loss",
+                                           "Up, Down",
+                                           "Down, Up & larger avg loss, ",
+                                           "Steeper Up, Flatter Up & smaller avg loss",
+                                           "Flatter Up, Steeper Up",
+                                           "Steep Up, Steep Up & higher avg loss"))
+                       ),
+    .before = 2
+    )
+```
+
+Now we can make a map with the deforestation trends and a highlight in 
+border for the SV municipalites
+
+```{r}
+dt <- tm_shape(classifier) +
+    tm_fill(col = "gen_trend", 
+                # style = style_string, # Check out this page for all the possible styles https://geocompr.github.io/post/2019/tmap-color-scales/
+                palette= "-RdYlGn",
+                colorNA = "#DCDCDC",
+                title = "Deforestation Trends\nin Mexico with\nSV mun with black border",
+                legend.is.portrait = TRUE
+            ) +
+  tm_shape(classifier %>% filter(sv_participates > 0)) +
+  tm_borders(col = "black")
+
+dt
+
+tmap_save(dt, filename = "paper1/ploP1/def_trends_sv_borders_20221003.png", 
+          height = 15,
+          units = "cm")
+```
+
+We can analyze the map very simply by looking at those muns with SV and those 
+without, a) what is the relative distribution of these categories in and out of 
+the program
+And for those within the program
+b) what is the allocation of resources in terms of 
+- num bene
+- percentage of families
+
+A simple boxplot of the woody cover loss trends in and out of the program
+can be informative, although it would be even better if we regionalized the
+figures as the East of the country behaves different from the Center and North
+from what we can tell from the maps above.
+
+```{r}
+box_def <- ggplot(data = classifier, 
+                  mapping = aes(x = gen_trend, 
+                                y = log(gfw_avg_loss_16to18), 
+                                fill = as.logical(sv_participates) )) +
+  geom_boxplot(width = 0.5 ) +
+  labs(x = "Cover loss trend 'flow'",
+       y = "Ln(avg hectares lost yearly in 2016-2018) ") +
+  scale_y_continuous(labels = scales::label_number()) +
+  stat_compare_means(method = "anova", label.y.npc = .8) +   # Add global annova p-value
+  labs(fill = "Participates in SV")
+
+box_def
+```
+
+Also key to look at how the program distributed the efforts in terms of 
+percentage of families recruited and direct number of beneficiaries
+
+```{r}
+box_def2 <- ggplot(data = classifier %>% filter(sv_final_num_beneficiarios_0 > 0), 
+                  mapping = aes(x = gen_trend, 
+                                y = sv_final_num_beneficiarios_0)) +
+  geom_boxplot(width = 0.5 ) +
+  labs(x = "Cover loss trend",
+       y = "Number of beneficiaries") +
+  scale_y_continuous(labels = scales::label_number()) +
+  stat_compare_means(method = "anova", label.y.npc = .1) +
+  coord_cartesian(ylim = c(0, 3000)) # +
+#  scale_y_continuous(limits = c(0,3000)) this line removes the outliers that do not appear in the graph from the calculation but we do not want that
+
+box_def2
+
+ggsave(box_def2, filename = "paper1/ploP1/def_trends_boxplot_20221003.png", )
+```
+
+By the graph above we can think that SV did allocate different number of beneficiaries
+to the categories in the x axis, however, the graph below shows that there was no
+difference in the proportion of families recruited in each trend
+
+```{r}
+box_def3 <- ggplot(data = classifier %>% filter(sv_final_num_beneficiarios_0 > 0), 
+                  mapping = aes(x = gen_trend, 
+                                y = sv_pfam_rec_0)) +
+  geom_boxplot(width = 0.5 ) +
+  labs(x = "Cover loss trend 'flow'",
+       y = "% of families recruited") +
+  scale_y_continuous(labels = scales::label_percent()) +
+  stat_compare_means(method = "anova", label.y.npc = .8) 
+
+box_def3
+```
+
+It would be useful to analyze these data to have a visual aid that can
+take the CVEGEO of a municipality and plot the trends, inspired in what we 
+did above
+
+```{r}
+## You can definitely generalize this function by adding a vector of muns and then calling 
+# geom_line
+plot_def_trend <- function(database = st_drop_geometry(z3), 
+                           interval1 = c(2016, 2018), 
+                           interval2 = c(2001, 2018), 
+                           muns = c("20302")) {
+# Define two datasets filtered for the first and second interval
+d1 <- database %>% filter(loss_year >= interval1[1], loss_year <= interval1[2], CVEGEO %in% muns)
+d2 <- database %>% filter(loss_year >= interval2[1], loss_year <= interval2[2], CVEGEO %in% muns)
+                    
+ggplot(data = database %>% 
+         filter(CVEGEO %in% muns),
+       aes(x = loss_year, y = loss_ha)) +
+  geom_line() +
+  geom_smooth(data = d1, 
+              method = "lm",
+              se = FALSE) +
+  geom_smooth(data = d2, 
+              method = "lm",
+              se = FALSE,
+              color = "orange") +
+  ggpubr::stat_regline_equation(data = d1,
+                                label.y.npc = .8 ,
+                                label.x.npc = .1,
+                                aes(x = loss_year, y = loss_ha, label = ..eq.label..),
+                                color = "blue") +
+  ggpubr::stat_regline_equation(data = d2, 
+                                label.y.npc = .7, 
+                                label.x.npc = .1, 
+                                aes(x = loss_year, y = loss_ha, label = ..eq.label..),
+                                color = "orange")
+  }
+```
+
+We can have a look at a great diversity of scenarios with this function and
+almost with no work:
+
+```{r}
+plot_def_trend(muns = "20302")
+plot_def_trend(muns = "07059")
+```
+
+## Can we detect a signal of inversion on deforestation trends in municipalities with SV?
+
+A first straightforward analysis is to see if the arrival of SV to the 
+municipality caused an inflection point in deforestation, but for this we might
+be better off if we just consider municipalities with more than k = 100 beneficiaries
+because the others might have very little data. Another key consideration is to
+only run this analysis on muncipalities in which the program has been operating
+for 3 years, should not 
+
+```{r}
+k <- 100 # A threshold for minimum number of beneficiaries 
+  
+tm_shape(lm_loss_pre_sv) + 
+  tm_fill(col = "angle_dif", 
+                style = "fixed", breaks = c(-50, -30, -20, -10, 0, 10, 20, 30, 50),
+                palette= "Spectral",
+                colorNA = NULL,
+                title = "Angle between trends in cover loss comparing 16-18 and 19-21\npositive angles means cover loss trend slope decreased in 19-21",
+                legend.is.portrait = FALSE
+    ) +
+    tm_layout(
+      legend.title.size = .8,
+      legend.width = 1
+    ) +
+  tm_shape(z %>% filter(sv_participates > 0)) +
+  tm_borders(col = "black")
+```
+
+We can now map the inversion of deforestation trends in and out of SV by 
+using the variable _inversion favors sv_
+
+```{r}
+tm_shape(lm_loss_pre_sv %>% mutate(inversion_favors_sv = as.character(inversion_favors_sv))) + 
+  tm_fill(col = "inversion_favors_sv", 
+                style = "cat",
+                palette= "Spectral",
+                colorNA = NULL,
+                title = "Municipalities that inverted their\ndeforestation trend after SV arrived",
+          legend.hist = TRUE
+    ) +
+    tm_layout(
+      legend.title.size = .8,
+      legend.width = 1,
+      legend.outside = TRUE
+    ) +
+  tm_shape(z %>% filter(sv_participates > 0)) +
+  tm_borders(col = "grey") +
+  tm_shape(z %>% filter(sv_pfam_rec > .30)) +
+  tm_borders(col = "black")
+  
+```
+
+First a straightforward graph relates the change in angle with 
+the percentage of recruitment and the year of arrival of SV
+
+```{r}
+lm_loss_pre_sv <- lm_loss_pre_sv %>% 
+  mutate(
+    sv_participation_category = pmin(10 * round(sv_pfam_rec_0 / max(sv_pfam_rec_0, na.rm = TRUE), digits = 1), 8) # Breaks pfam_rec into 8 groups of participation, the lager the number the more participation
+  )
+```
+
+
+```{r}
+ggplot(data = lm_loss_pre_sv, aes(x = sv_pfam_rec_0, y = angle_dif)) +
+  geom_point() +
+  geom_smooth() +
+  facet_grid(rows = vars(sv_first_payment_year))
+```
+
+A hypothesis is that the percentage of families
+recruited can be expected to be high in order to have an impact. The big question
+is: where is that threshold?
+
+What we need here is a graph that shows you how given the percentage 
+of area or the percentage of population you recruited the proportion of
+municipalities that did invert their deforestation trend
+
+```{r eval=FALSE, include=FALSE}
+# first filter only 2019 
+# then you use inversion_favors_sv for more simplicity
+# define k a threshold for sv_pfam_rec and allow k to range free
+
+intervals <- seq(from = 0.01, to = 0.50, by = 0.01)
+
+tt <- data.frame()
+for(k in seq_along(intervals)){
+  rw <- lm_loss_pre_sv %>% 
+    st_drop_geometry() %>% 
+  filter(sv_first_payment_year == 2019) %>% 
+  filter(sv_pfam_rec_0 > intervals[k]) %>% 
+  group_by(inversion_favors_sv) %>% 
+  summarise(num_of_incidences = n())
+
+  
+## PENDING TO EXTRACT THE VALUES
+  rw2 <- c(intervals[k], rw)
+
+  tt <- rbind(tt, rw2)
+}
+
+tt <- as_tibble(tt)
+names(tt) <- c("pct_of_fams_rec","against_sv" , "no_inv", "favors_sv")
+  
+```
+
+
+How does this work? for a series of breaks seq(from= 0 ,to = .4 by = 0.05) we 
+have to calculate how many of those municipalities have a percentage of families
+recruited above that number, and from that, count all the muns that have on each
+_inversion_favors_sv_ category and report it as a row. This would yield a table 
+with 
+Minimum pfam_rec | -1s | 0 | 1s
+and this could become a bar graph or even a simple area 100% distribution
+
+Let us see the scatterplots of the relationship between the angles of the trends
+and the percentage of families recruited | area intervened
+
+```{r}
+ggplot(lm_loss_pre_sv %>% filter(sv_participates > 0)) +
+  geom_point(mapping = aes(x = sv_pfam_rec_0, y = angle_dif))
+```
+
+We can also look at the scatterplot as a function of the area intervened
+
+```{r}
+ggplot(lm_loss_pre_sv %>% filter(sv_participates > 0)) +
+  geom_point(mapping = aes(x = sv_area_trans_perc, y = angle_dif))
+```
+
+
+### Correlations between regression variables
+
+We have to check correlations between variables as IRS is a new variable
+for the dataset and that might bring some surprises
+
+```{r}
+g_correl_sv <- cor(st_drop_geometry(z) %>% 
+                     select(
+                       irs_20_index,
+                       sv_final_num_beneficiarios_0,
+                       sv_pfam_rec_0,
+                       gfw_avg_loss_01to18,
+                       gfw_avg_loss_01to21,
+                       kpi_prop,
+                       rpi_prop
+                     ), use = "complete.obs") 
+corrplot::corrplot.mixed(g_correl_sv,
+                             diag = "u",
+                             tl.pos = "lt",
+                         upper = "pie")
+```
+

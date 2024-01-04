@@ -1,0 +1,782 @@
+---
+title: "A tidy interpretation of linear models"
+author: "Pablo"
+date: "2022-12-21"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# knitr::opts_knit$set(root.dir = './../..')
+library(tidyverse)
+library(sf)
+library(pscl)
+library(jtools)
+```
+
+```{r include=FALSE}
+## Load db to fit models
+z <- read_csv("paper1/datP1/finalDB.csv")
+```
+
+```{r include =FALSE}
+# A key modification to the database z is to filter it to only include the 21
+# states that form part of the study
+
+sv_active_states <- z %>% group_by(CVE_ENT) %>% 
+  st_drop_geometry() %>% 
+  summarise(state_total = sum(sv_final_num_beneficiarios_0)) %>% 
+  filter(state_total > 18) 
+# reports 21 states with SV and here I am removing Zacatecas because it will just
+# generate noise to keep a state with 18 beneficiaries
+
+z <- z %>% filter(CVE_ENT %in% pull(sv_active_states, CVE_ENT))
+
+# In case we want to map state borders
+state_borders <- read_sf("data/raw/spatial/mgs/INEGI_2021-12_MarcoGeoestadistico/mg2021_integrado/conjunto_de_datos/00ent.shp")
+```
+
+# Step A. Variable re-scaling
+
+```{r, include=FALSE}
+v <- z %>% select( 
+  sv_participates, # participation, binary, TRUE for all municipalities that have at least 1 beneficiary
+  sv_final_num_beneficiarios_0, # Number of beneficiaries
+  sv_pfam_rec, # This percentage is calculated only over participating municipalities
+  # with at least one beneficiary
+  area21, # Might be used
+  i20_TOTHOG, # We need to account for population and area to stay out of bias, and i20_rural_households might not respond well because all urban and periurban municipalities show 0 rural households
+  i20_rural_households, # Here important to note that metropolitan municipalities have 0 households
+  irs_20_index, # continuous poverty index
+  gfw_area_forest_perc, # Percentage of the municipality covered by forest
+  gfw_pondTreeCover, # Absolute area of forest in municipality
+  gfw_avg_norm_loss_01to18, # Average forest cover loss rate -- NOT USED
+  gfw_avg_loss_01to18, # Absolute yearly loss -- NOT USED
+  kpi_prop, # proportion of the territory categorized as of conservation priority
+  rpi_prop, # restoration priority proportional (see above kpi)
+  mean_sh_morena, # percentage of the municipality inhabitants that elected 4T current admin
+  dist_to_4Tmega # distance in KM to the closest megaproyect of 4T
+) 
+```
+
+We have a look at the variables in their raw nature
+
+```{r}
+vtable::sumtable(v,
+         out = "return" # either return or kable
+         )
+```
+
+And we transform them into variables that once modelled are easy to
+interpret in terms of their compared effect, for example, a one unit
+increase for each index, although these are not equally distributed, can
+give a better sense of which has an stronger effect in comparison to two
+indexes that vary across different ranges. We also rename them for easy
+reading.
+
+```{r}
+vrs <- v %>% 
+  mutate(
+  sv_participates = as.numeric(sv_final_num_beneficiarios_0 > 2), # decided to not consider muns with 1 or 2 beneficiaries as participating because in all cases
+  # these beneficiaries represent less than 1/1000 of the households
+  area_100sqkm = area21 / 100, # The name suggests 1 unit represents 100 sqkm
+  households_100 = i20_TOTHOG/100,
+  rhouseholds_100 = ((i20_rural_households + 1)/ 100), # This variable takes zero for all periurban municipalities and is transformed into a non-zero value by adding one household to all
+  poverty_index = (irs_20_index - min(v$irs_20_index, na.rm = TRUE)) * (5 / (max(v$irs_20_index, na.rm = TRUE)- min(v$irs_20_index, na.rm = TRUE))), # poverty index distribution is zero centered, but it takes values in the negative numbers, so we have to substract the min to make the lowest value a zero, then normalize base 5
+  forest_cover_index = gfw_area_forest_perc * 5, # This percentage in [0, 1] is turned into an equivalent index in [0,5]
+  area_forest_50sqkm = gfw_pondTreeCover / ((50) * (100)), # pondTreeCover is in hectares and there are 100 ha in one sqkm
+  forest_loss_year_50ha = gfw_avg_loss_01to18 / 50, # Units comprise 50 hectares
+  conservation_index = sqrt(kpi_prop) * (5 / sqrt(max(v$kpi_prop, na.rm = TRUE))), # rescale to [0,5] and apply square root transformation to widen the distribution
+  restoration_index = sqrt(rpi_prop) * (5 / sqrt(max(v$rpi_prop, na.rm = TRUE))),
+  sv_final_num_beneficiarios_0 = as.integer(sv_final_num_beneficiarios_0) # our predicted variable in zero inflated models
+  )
+```
+
+```{r, include=FALSE}
+l.vrs <- length(names(vrs))
+vrs <- vrs %>% 
+  select(
+    1:3, 
+    16:all_of(l.vrs)
+  )
+```
+
+Now we can display a summary table of all the variables to be used to
+confirm we have
+
+```{r}
+vtable::sumtable(vrs,
+         out = "return" # either return or kable
+         )
+```
+
+```{r, include=FALSE}
+# Making up a dataset that includes distance to 4T to test its relevance
+v_mega <- z %>% 
+  mutate(
+  sv_participates = as.numeric(sv_final_num_beneficiarios_0 > 2), 
+  area_100sqkm = area21 / 100, 
+  households_100 = i20_TOTHOG/100,
+  rhouseholds_100 = ((i20_rural_households + 1)/ 100), 
+  poverty_index = (irs_20_index - min(v$irs_20_index, na.rm = TRUE)) * (5 / (max(v$irs_20_index, na.rm = TRUE)- min(v$irs_20_index, na.rm = TRUE))), 
+  forest_cover_index = gfw_area_forest_perc * 5, 
+  area_forest_50sqkm = gfw_pondTreeCover / (50) * (100),
+  forest_loss_year_50ha = gfw_avg_loss_01to18 / 50,
+  conservation_index = sqrt(kpi_prop) * (5 / sqrt(max(v$kpi_prop, na.rm = TRUE))), 
+  restoration_index = sqrt(rpi_prop) * (5 / sqrt(max(v$rpi_prop, na.rm = TRUE))),
+  sv_final_num_beneficiarios_0 = as.integer(sv_final_num_beneficiarios_0) 
+  ) %>% 
+  mutate(
+  households_new = households_100 / 10,
+)
+```
+
+## Option 1. Logistic Regression predicts municipality participation
+
+We fit the model with variables that end up being statistically relevant
+and that cover our subjects of interest: conservation priority areas,
+forest cover, forest loss, area and population. To see how we arrived to
+the model we can go back to previous versions of the document starting
+with "6" in this project.
+
+```{r, include=FALSE}
+lr1<- glm(formula = sv_participates ~ gfw_pondTreeCover + gfw_area_forest_perc +  gfw_avg_loss_01to18 + irs_20_index + kpi_prop + rpi_prop + area21 + i20_TOTHOG, 
+                family = binomial, 
+                data = v
+                )
+
+summary(lr1)
+```
+
+```{r, include=FALSE}
+lr2 <- glm(formula = sv_participates ~ gfw_area_forest_perc + irs_20_index + gfw_pondTreeCover + kpi_prop + dist_to_4Tmega,
+           family = binomial,
+                data = v)
+
+```
+
+We fit the logistic model with our re-scaled variables.
+
+```{r}
+lr3 <- glm(formula = sv_participates ~ forest_cover_index + poverty_index + sqrt(area_forest_50sqkm) + conservation_index + restoration_index + area_100sqkm + sqrt(households_100),
+           family = binomial,
+                data = vrs)
+summary(lr3)
+```
+
+Important to asess the fit of the model
+
+```{r}
+plot(lr3)
+```
+
+We can plot the coefficients of the logistic regression and their
+confidence intervals. It is important to be aware that this model
+predicts participation and will have the opposed coefficients to a zero
+inflation logistic that predicts when a municipality is a zero in the
+distribution of number of beneficiaries.
+
+```{r, warning=FALSE}
+plot_summs(lr3, 
+           robust = TRUE, 
+           model.names = c("Logistic predicts participation"), 
+           omit.coefs = FALSE
+           )
+```
+
+From the graph above we can conclude that, for participation, poverty is
+by far the most relevant index, followed by forest cover index (which is
+proportional to proportional forest cover) and finally by restoration
+index (not statistically significant, so should not be brought up),
+which is what would be expected from a restoration program, to address
+the regions that are prioritary for restoration.
+
+We remark that population is positive and significant, that municipality
+area is statistically significant and negative, so very big
+municipalities are less likely to be selected, and that conservation
+index deters municipality level participation to quite an important
+degree.
+
+## Option 1.1 Multiple linear regression predicts participation intensity
+
+We applied a linear model only over municipalities that are already
+participating. In **lm3** we incorporate re-scaled variables and we
+predict the squared root of the percentage of families that were
+recruited by SV out of all the families living in the municipality,
+which we call also participation intensity.
+
+```{r}
+lm3 <- lm(sqrt(sv_pfam_rec) ~ poverty_index + sqrt(households_100) + area_100sqkm + conservation_index + restoration_index + forest_loss_year_50ha + forest_cover_index,
+                data = vrs)
+summary(lm3)
+```
+
+The two variable transformations allowed us to get a very acceptable
+fit.
+
+```{r}
+plot(lm3)
+```
+
+The easiest way to comment on the model is by having a graphical
+reference
+
+```{r}
+plot_summs(lm3, 
+           robust = TRUE, 
+           model.names = c("Linear Model predicts participation intensity"), 
+           omit.coefs = c("(Intercept)", "sqrt(households_100)", "area_100sqkm")
+           )
+```
+
+Somehow contradicting the results of the logistic participation
+regression, participation intensity is favored by conservation priority
+and disfavored by restoration priority, contrary to the expectation.
+
+We can also see that poverty and deforestation are related in an
+incremental way to participation intensity, as expected. It is also
+expected to think that we want to resotre in regions where forest cover
+index is smaller, as normally reforesting very forested areas will not
+aggregate much value.
+
+```{r, include=FALSE}
+lm_mega <- lm(sqrt(sv_pfam_rec) ~ poverty_index + sqrt(households_100) + area_100sqkm + conservation_index + restoration_index + forest_loss_year_50ha + forest_cover_index + dist_to_4Tmega,
+                data = v_mega)
+summary(lm_mega)
+```
+
+```{r, include=FALSE}
+lr_mega <- glm(formula = sv_participates ~ forest_cover_index + poverty_index + sqrt(area_forest_50sqkm) + conservation_index + restoration_index + area_100sqkm + sqrt(households_100) + dist_to_4Tmega,
+           family = binomial,
+                data = v_mega)
+summary(lr_mega)
+```
+
+## Option 2. Zero Inflated Binomial predicts sv participant counts by municipality
+
+```{r}
+vrs <- vrs %>% select(-sv_pfam_rec) %>% drop_na() # Removing the NAs from the data
+```
+
+We turn to our re-scaled variables to fit the Zero Inflated Binomial
+
+First, offsetting by households as recommended by Liam
+
+```{r}
+# households re-scaled to stay within bounds for modelling
+
+vrs <- vrs %>% mutate(
+  households_new = households_100 / 10,
+)
+
+# It was impossible to fit area_forest due to its very wide range so was sqrt transformed
+zif1 <- zeroinfl(sv_final_num_beneficiarios_0 ~ poverty_index + sqrt(area_forest_50sqkm) + forest_loss_year_50ha + conservation_index + restoration_index + offset(log(households_new)) | poverty_index + conservation_index + restoration_index + sqrt(area_forest_50sqkm) + forest_cover_index,
+                 data = vrs,
+                 dist = "negbin"
+                 )
+
+summary(zif1)
+```
+
+We can diagnose the accuracy of zif1, and zero inflation is reported to
+be quite bad despite being quite good when we do not apply log() to the
+number of households We also control the extratospherical max values
+
+```{r}
+# Two diagnostics on zif_test
+as_tibble(zif1$fitted.values) %>% arrange(desc(value)) %>% slice_head(n = 5)
+performance::check_zeroinflation(zif1)
+```
+
+And the other decision we can make is to not log the number of
+households, which gives us a very good zero prediction, but very
+inaccurate prediction values
+
+```{r}
+zif2 <- zeroinfl(sv_final_num_beneficiarios_0 ~ poverty_index + sqrt(area_forest_50sqkm) + forest_loss_year_50ha + conservation_index + restoration_index + offset(households_new) | poverty_index + conservation_index + sqrt(area_forest_50sqkm) + forest_cover_index,
+                 data = vrs,
+                 dist = "negbin"
+                 )
+
+summary(zif2)
+```
+
+We can apply the two same diagnostics we have above
+
+```{r}
+# Two diagnostics on zif_test
+as_tibble(zif2$fitted.values) %>% arrange(desc(value)) %>% slice_head(n = 5)
+performance::check_zeroinflation(zif2)
+```
+
+And a very natural approach would be to not use any offset and try to
+fit for counts
+
+```{r}
+
+# It was impossible to fit area_forest_new linearly, it was sqrt-transformed
+zif3 <- zeroinfl(sv_final_num_beneficiarios_0 ~ poverty_index + sqrt(area_forest_50sqkm) +
+                   forest_loss_year_50ha + conservation_index + restoration_index | poverty_index + conservation_index + sqrt(area_forest_50sqkm) + forest_cover_index,
+                 data = vrs,
+                 dist = "negbin"
+)
+
+summary(zif3)
+```
+
+It is quite confusing to see that the non-offsetted model is very
+innacurate on the value prediction and in the zero inflation too.
+
+```{r}
+performance::check_zeroinflation(zif3)
+```
+
+Values of zif3 are too high
+
+```{r}
+# Two diagnostics on zif_test
+as_tibble(zif3$fitted.values) %>% arrange(desc(value)) %>% slice_head(n = 10)
+```
+
+We can also apply a high base log to the offset to see if that has an
+effect on keeping the households values low
+
+```{r}
+zif4 <- zeroinfl(sv_final_num_beneficiarios_0 ~ poverty_index + sqrt(area_forest_50sqkm) + forest_loss_year_50ha + conservation_index + restoration_index + offset(log(households_new, base = 10)) | poverty_index + conservation_index + sqrt(area_forest_50sqkm) + forest_cover_index,
+                 data = vrs,
+                 dist = "negbin"
+                 )
+
+summary(zif4)
+```
+
+We can apply the two same diagnostics we have above
+
+```{r}
+# Two diagnostics on zif_test
+as_tibble(zif4$fitted.values) %>% arrange(desc(value)) %>% slice_head(n = 5)
+performance::check_zeroinflation(zif4)
+```
+
+There seem to be no packages to visualize ZINB coefficients, so had to
+build my own plots in order to reflect on the coefficient values.
+
+```{r}
+plot_table <- confint.default(zif1)
+labels <- rownames(plot_table)
+
+plot_table <- bind_cols(n = 1:12, coef = c(zif1$coefficients$count, zif1$coefficients$zero) %>% unname(), as_tibble(plot_table))
+names(plot_table) <- c( "n", "c" ,"l", "u")
+plot_table <- plot_table %>% mutate(n = factor(n, labels = labels))
+
+counts <- slice_head(plot_table, n = 6)
+zero <- slice_tail(plot_table, n = 6)
+
+ecounts <- counts %>% mutate(
+  across(2:4, .fns = exp)
+  )
+
+ggplot(data = counts, aes(n, c)) + 
+  geom_pointrange(aes(ymin = l, ymax = u)) +
+  coord_flip() + 
+  geom_hline(yintercept = 0, color = "grey") +
+  labs(title = "Coefficients value for counts data",
+       x = NULL,
+       y = "Coefficient value")
+
+ggplot(data = ecounts, aes(n, c)) + 
+  geom_pointrange(aes(ymin = l, ymax = u)) +
+  coord_flip() + 
+  geom_hline(yintercept = 0, color = "purple") +
+  labs(title = "Exponentiated coefficients for counts data",
+       x = NULL,
+       y = "Coefficient value")
+
+ggplot(data = zero, aes(n, c)) + 
+  geom_pointrange(aes(ymin = l, ymax = u)) +
+  coord_flip() + 
+  geom_hline(yintercept = 0, color = "navy") +
+  labs(title = "Coefficients value for zero inflation logistic\n(predicts if municipality does not participate\ncontrary to logistic reg above)",
+       x = NULL,
+       y = "Coefficient value")
+```
+
+As expected, the zero-inflation logistic regression acts quite similar
+but in opposite way to the regression presented in Option 1.
+
+A key question is whether we would derive the same results from the
+linear model in Option 1 than from the ZINB model. And by looking at the
+graphs it seems like yes, they would be the same results. Conservation,
+poverty and deforestation are related to an increased recruitment
+intensity, while restoration priority ends up as a counterweight to the
+intensity of participation.
+
+If we include distance to megaprojects, the coefficient sign for poverty
+flips suggesting that such variable is very influential as it can
+transform the most "heavy" coefficient of all
+
+```{r}
+
+zif_mega <- zeroinfl(sv_final_num_beneficiarios_0 ~ poverty_index + sqrt(area_forest_50sqkm) + forest_loss_year_50ha + conservation_index + restoration_index + sqrt(dist_to_4Tmega) + offset(log(households_new)) | poverty_index + conservation_index + restoration_index + sqrt(area_forest_50sqkm) + forest_cover_index + sqrt(dist_to_4Tmega),
+                 data = v_mega,
+                 dist = "negbin"
+                 )
+summary(zif_mega)
+```
+
+I decided to showcase a table with some of the most common reference
+values, which are the percentiles zero, 25 and 75 and 100 (the max
+value) to get an idea of how the negative binomial model for counts is
+functioning.
+
+```{r}
+# Add some values to each variable so that we can visualize prediction, the mean
+# and the percentiles
+
+vrs <- vrs %>% 
+  mutate(
+    sqrt_area_forest_50sqkm = sqrt(area_forest_50sqkm)
+  )
+
+sk <- skimr::skim(vrs, poverty_index, sqrt_area_forest_50sqkm, forest_loss_year_50ha, conservation_index, restoration_index, households_new)
+
+
+
+sk <- sk %>% 
+  as_tibble() %>% 
+  select(skim_variable, numeric.p0, numeric.p25, numeric.p75, numeric.p100) %>% 
+  mutate(
+    numeric.p0 = round(numeric.p0),
+    numeric.p25 = ceiling(numeric.p25),
+    numeric.p75 = ceiling(numeric.p75)
+  )
+
+exa <- sk %>% 
+  pivot_longer(cols = 2:5, names_to = "percentile", values_to = "value") %>% # This is just a 2 step transposing of the table
+  pivot_wider(names_from = skim_variable, values_from = value) %>% 
+  tidyr::expand(poverty_index, sqrt_area_forest_50sqkm, forest_loss_year_50ha, conservation_index, restoration_index, households_new) # Expand it to a grid
+
+## And now we apply our linear function to the result we got
+
+exa <- exa %>% mutate(
+  predicted.mean.sv.bene = exp(zif1$coefficients$count[[1]] +
+                                poverty_index * zif1$coefficients$count[[2]] +
+                                sqrt_area_forest_50sqkm * zif1$coefficients$count[[3]] + 
+                                forest_loss_year_50ha * zif1$coefficients$count[[4]] +
+                                conservation_index * zif1$coefficients$count[[5]] +
+                                restoration_index * zif1$coefficients$count[[6]] +
+                                log(households_new)
+                                ) 
+)
+
+slice_sample(exa, n = 20)
+
+```
+
+I also attempted to construct my own predictions in order to compare
+them with the actual data. This table make me suspect that the model is
+really not doing a good work.
+
+```{r}
+prediction <- vrs %>% 
+  select(poverty_index, sqrt_area_forest_50sqkm, forest_loss_year_50ha, conservation_index, restoration_index, households_new, sv_final_num_beneficiarios_0) %>% 
+  mutate(
+  predicted.bene.manual = exp(zif1$coefficients$count[[1]] +
+                                poverty_index * zif1$coefficients$count[[2]] +
+                                sqrt_area_forest_50sqkm * zif1$coefficients$count[[3]] + 
+                                forest_loss_year_50ha * zif1$coefficients$count[[4]] +
+                                conservation_index * zif1$coefficients$count[[5]] +
+                                restoration_index * zif1$coefficients$count[[6]] +
+                                log(households_new)
+                                ) 
+)
+
+slice_sample(prediction, n = 50)
+```
+
+Below, I attempted to use the model information itself in order to build
+predictions. Can we predict rates based on [Spedicato's
+response](https://stats.stackexchange.com/questions/26449/predict-glm-poisson-with-offset)
+by opting to nullify the offset? It did not work as expected but allowed
+me to confirm that zero inflation is working with *predictions_z* and
+
+```{r}
+prediction2 <- vrs %>% 
+  select(poverty_index, sqrt_area_forest_50sqkm, forest_loss_year_50ha, conservation_index, restoration_index, forest_cover_index, sv_final_num_beneficiarios_0, households_100) %>% 
+  mutate(
+  households_new = 1,
+  area_forest_50sqkm = sqrt_area_forest_50sqkm ^ 2
+)
+
+predictions_z <- predict(zif1, prediction2, "zero")
+cat("Number of zeros from zero inflation:", length(predictions_z[predictions_z > 0.5]))
+
+predictions_bene <- predict(zif1, prediction2, "response") %>% 
+  round() %>% 
+  table() %>% 
+  as_tibble() %>% 
+  mutate(num.of.benef = as.numeric(.))
+
+ggplot(predictions_bene) + 
+  geom_col(aes(num.of.benef, n)) +
+  labs(x = "number of sv beneficiaries in the municipality",
+       y = "number of municipalities with such number of beneficiaries")
+
+```
+
+We can also apply the Negative Binomial on its own and see how well it
+predicts the zeros
+
+```{r}
+negbin1 <- MASS::glm.nb(sv_final_num_beneficiarios_0 ~ poverty_index + 
+                          sqrt(area_forest_50sqkm) + 
+                          forest_loss_year_50ha + 
+                          conservation_index + 
+                          restoration_index + 
+                          offset(log(households_new)),
+                             data = vrs)
+
+summary(negbin1)
+```
+
+Diagnose with the same method
+
+```{r}
+# Two diagnostics on zif_test
+as_tibble(negbin1$fitted.values) %>% arrange(desc(value)) %>% slice_head(n = 5)
+performance::check_zeroinflation(negbin1)
+```
+
+What would happen if we do not log the offset? The NB ML predictor would
+not be able to converge, and it does not converge without offset either
+
+```{r eval=FALSE, include=FALSE}
+negbin2 <- MASS::glm.nb(sv_final_num_beneficiarios_0 ~ poverty_index + 
+                          sqrt(area_forest_50sqkm) + 
+                          forest_loss_year_50ha + 
+                          conservation_index + 
+                          restoration_index,
+                             data = vrs)
+
+summary(negbin2)
+```
+
+## Tabular visuals
+
+Below I present some coefficients in organized tables just as a
+reference. For ZINB I have the three models that were discussed in the
+section, while for Option 1. I only present the preferred model that I
+selected after long search.
+
+```{r, warning=FALSE}
+stargazer::stargazer(zif1, zif2, zif3, 
+                     keep.stat = "n",
+                     colnames = TRUE,
+                     type = "text", 
+                     title = "Zero inflated - logistic component of ZINB",
+                     ci = TRUE,
+                     zero.component = TRUE,
+                     nobs = TRUE,
+                     min.max = TRUE,
+                     mean.sd = TRUE
+)
+
+```
+
+Here for the counts model First the raw coefficients
+
+```{r, warning=FALSE}
+stargazer::stargazer(zif1, zif2, zif3, zif4,
+                     colnames = TRUE,
+                     type = "text", 
+                     title = "COEFFICIENTS Zero inflated - NB counts",
+                     ci = TRUE,
+                     nobs = TRUE,
+                     min.max = TRUE,
+                     mean.sd = TRUE
+)
+
+```
+
+And posteriorly the exponentiated coefficients
+
+```{r, warning=FALSE}
+stargazer::stargazer(zif1, zif2, zif3, zif4,
+                     apply.coef = exp,
+                     colnames = TRUE,
+                     type = "text", 
+                     title = "EXPONENTIATED Zero inflated - NB counts",
+                     ci = TRUE,
+                     nobs = TRUE,
+                     min.max = TRUE,
+                     mean.sd = TRUE
+)
+
+```
+
+We do the same for the linear and logistic model but only report our
+preferred single model, which has the variables re-scaled
+
+For the logistic
+
+```{r, warning=FALSE}
+stargazer::stargazer(lr3, 
+                     colnames = TRUE,
+                     type = "text", 
+                     title = "Logistic - predicts municipality participation in SV",
+                     ci = TRUE,
+                     nobs = TRUE,
+                     min.max = TRUE,
+                     mean.sd = TRUE
+)
+
+```
+
+And for the MLR, after the abrupt decision of transforming households
+and not using rural households due to the confusing nature of it
+
+```{r, warning=FALSE}
+stargazer::stargazer(lm3, 
+                     colnames = TRUE,
+                     type = "text", 
+                     title = "Multiple Linear Regression predicts intensity of participation by municipality",
+                     ci = TRUE,
+                     nobs = TRUE,
+                     min.max = TRUE,
+                     mean.sd = TRUE
+)
+
+```
+
+When writing the paper, I came across the inconsistency that we need to
+include poverty, indexes and forest loss in the models almost forcefully
+because those are the three variables of key interest in the paper,
+however, my zif1 is not using forest cover loss for the count model and
+that will probably generate pushback from reviewers because it contrasts
+with the narrative that we are constantly building in the paper, so I
+might try again to include it
+
+```{r}
+# households re-scaled to stay within bounds for modelling
+
+vrs <- vrs %>% mutate(
+  households_new = households_100 / 10,
+)
+
+# It was impossible to fit area_forest due to its very wide range so was sqrt transformed
+zif5 <- zeroinfl(sv_final_num_beneficiarios_0 ~ poverty_index + sqrt(area_forest_50sqkm) + forest_loss_year_50ha + conservation_index + restoration_index + offset(log(households_new)) | poverty_index + conservation_index + restoration_index + sqrt(area_forest_50sqkm) + forest_loss_year_50ha + forest_cover_index,
+                 data = vrs,
+                 dist = "negbin"
+                 )
+
+summary(zif5)
+```
+
+We re-define the tables used in script 5.1_figsPaper and instead of
+using zif1 we use zif5 with the addition of forest cover loss in the
+zero inflation component of the ZINB
+
+```{r substituting zif1 for zif5 that includes forest cover loss}
+plot_table <- confint.default(zif5)
+labels <- rownames(plot_table)
+
+plot_table <- bind_cols(n = 1:13, coef = c(zif5$coefficients$count, zif5$coefficients$zero) %>% unname(), as_tibble(plot_table))
+names(plot_table) <- c( "n", "c" ,"l", "u")
+plot_table <- plot_table %>% mutate(n = factor(n, labels = labels))
+
+counts <- slice_head(plot_table, n = 6)
+zero <- slice_tail(plot_table, n = 7)
+
+ecounts <- counts %>% mutate(
+  across(2:4, .fns = exp)
+  )
+
+ggplot(data = counts, aes(n, c)) + 
+  geom_pointrange(aes(ymin = l, ymax = u)) +
+  coord_flip() + 
+  geom_hline(yintercept = 0, color = "grey") +
+  labs(title = "Coefficients value for counts data",
+       x = NULL,
+       y = "Coefficient value")
+
+ggplot(data = ecounts, aes(n, c)) + 
+  geom_pointrange(aes(ymin = l, ymax = u)) +
+  coord_flip() + 
+  geom_hline(yintercept = 0, color = "purple") +
+  labs(title = "Exponentiated coefficients for counts data",
+       x = NULL,
+       y = "Coefficient value")
+
+ggplot(data = zero, aes(n, c)) + 
+  geom_pointrange(aes(ymin = l, ymax = u)) +
+  coord_flip() + 
+  geom_hline(yintercept = 0, color = "navy") +
+  labs(title = "Coefficients value for zero inflation logistic\n(predicts if municipality does not participate\ncontrary to logistic reg above)",
+       x = NULL,
+       y = "Coefficient value")
+```
+
+What would happen if we also offset the zero inflation model?
+
+```{r}
+
+# It was impossible to fit area_forest due to its very wide range so was sqrt transformed
+zif6 <- zeroinfl(sv_final_num_beneficiarios_0 ~ poverty_index + sqrt(area_forest_50sqkm) + forest_loss_year_50ha + conservation_index + restoration_index + offset(log(households_new)) | poverty_index + conservation_index + restoration_index + sqrt(area_forest_50sqkm) + forest_loss_year_50ha + forest_cover_index + offset(log(households_new)),
+                 data = vrs,
+                 dist = "negbin"
+                 )
+
+summary(zif6)
+```
+
+I did not include forest cover index in the counts because it turns out
+to be non significant and its inclusion does not change any coefficients
+
+```{r}
+
+# It was impossible to fit area_forest due to its very wide range so was sqrt transformed
+zif7 <- zeroinfl(sv_final_num_beneficiarios_0 ~ poverty_index + sqrt(area_forest_50sqkm) + forest_loss_year_50ha + conservation_index + restoration_index + forest_cover_index + offset(log(households_new)) | poverty_index + conservation_index + restoration_index + sqrt(area_forest_50sqkm) + forest_loss_year_50ha + forest_cover_index,
+                 data = vrs,
+                 dist = "negbin"
+                 )
+
+summary(zif7)
+```
+
+```{r}
+corrplot::corrplot.mixed(cor(vrs %>% select(sv_final_num_beneficiarios_0, poverty_index, area_forest_50sqkm, forest_loss_year_50ha, conservation_index, restoration_index,forest_cover_index )),
+                             diag = "u",
+                             tl.pos = "lt",
+                         upper = "pie")
+```
+
+```{r}
+
+# It was impossible to fit area_forest due to its very wide range so was sqrt transformed
+zif8 <- zeroinfl(sv_final_num_beneficiarios_0 ~ poverty_index + forest_loss_year_50ha + conservation_index + restoration_index + forest_cover_index + offset(log(households_new)) | poverty_index + conservation_index + restoration_index + forest_loss_year_50ha + forest_cover_index,
+                 data = vrs,
+                 dist = "negbin"
+                 )
+
+summary(zif8)
+```
+
+Checking variance inflation factors for the 
+
+```{r}
+nb_for_vif <- MASS::glm.nb(sv_final_num_beneficiarios_0 ~ poverty_index + sqrt(area_forest_50sqkm) + forest_loss_year_50ha + conservation_index + restoration_index + offset(log(households_new)),
+                           data = vrs %>% filter(sv_final_num_beneficiarios_0 > 0))
+
+rms::vif(nb_for_vif)
+```
+```{r}
+lm_for_vif <- glm(sv_final_num_beneficiarios_0 > 0 ~ poverty_index + conservation_index + sqrt(area_forest_50sqkm) + restoration_index + forest_loss_year_50ha + forest_cover_index,
+                family = binomial, 
+                data = vrs)
+
+rms::vif(lm_for_vif)
+```
+
